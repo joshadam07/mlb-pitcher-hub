@@ -1,0 +1,10 @@
+streamlit
+pandas
+numpy
+plotly
+pybaseball
+duckdb
+scikit-learn
+pyarrow
+lxml
+requests
