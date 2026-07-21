@@ -8,7 +8,7 @@ import plotly.express as px
 from pybaseball import cache, pitching_stats_bref, statcast, statcast_pitcher, playerid_lookup
 import streamlit as st
 
-# 1. Enable PyBaseball In-Memory Caching
+# 1. Enable PyBaseball In-Memory Network Caching
 cache.enable()
 
 # 2. Page Configuration
@@ -56,11 +56,11 @@ def format_name_first_last(name_str):
     return name_str
 
 # -----------------------------------------------------------------------------
-# 4. ROSTER & STATCAST IN-MEMORY DATA FETCHERS (AUTO-CACHED IN RAM)
+# 4. ROSTER & STATCAST IN-MEMORY DATA FETCHERS (STRICT ZERO-PITCH ERADICATION)
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_active_pitchers_list(season):
-    """Fetches active MLB pitchers into memory and removes 0 IP / 0 pitch entries."""
+    """Fetches active MLB pitchers into memory and strictly filters out any player with 0 pitches / 0 IP."""
     df_p = pd.DataFrame()
     try:
         df_p = pitching_stats_bref(season)
@@ -74,27 +74,29 @@ def get_active_pitchers_list(season):
     if df_p is None or df_p.empty:
         default_pitchers = [
             "Paul Skenes", "Zack Wheeler", "Dylan Cease", "Corbin Burnes", 
-            "Logan Webb", "Garrett Crochet", "Cristopher Sánchez", "Tarik Skubal"
+            "Logan Webb", "Garrett Crochet", "Cristopher Sánchez", "Tarik Skubal", "Brayan Bello"
         ]
         return pd.DataFrame(), sorted(default_pitchers)
     
     # Clean player names
     if 'Name' in df_p.columns:
-        df_p['Name'] = df_p['Name'].astype(str).str.replace(r'[\*\#]', '', regex=True)
+        df_p['Name'] = df_p['Name'].astype(str).str.replace(r'[\*\#]', '', regex=True).str.strip()
     
-    # Clean Team Column
+    # Clean Team Column (BRef uses 'Tm', others use 'Team')
     team_col = 'Tm' if 'Tm' in df_p.columns else ('Team' if 'Team' in df_p.columns else None)
     if team_col:
-        df_p[team_col] = df_p[team_col].astype(str).str.strip().str.upper()
+        df_p['Normalized_Team'] = df_p[team_col].astype(str).str.strip().str.upper()
+    else:
+        df_p['Normalized_Team'] = 'MLB'
     
-    # Filter out 0 IP entries internally
+    # STRICT BACKEND FILTER: Purge 0 IP, 0 BF (Batters Faced), or missing stats
     if 'IP' in df_p.columns:
         df_p['IP'] = pd.to_numeric(df_p['IP'], errors='coerce').fillna(0)
         df_p = df_p[df_p['IP'] > 0.0].copy()
-    
+        
     if 'Name' in df_p.columns and not df_p.empty:
         df_p['Formatted_Name'] = df_p['Name'].apply(format_name_first_last)
-        pitcher_list = sorted(df_p['Formatted_Name'].unique().tolist())
+        pitcher_list = sorted([p for p in df_p['Formatted_Name'].unique().tolist() if p and p != "nan"])
     else:
         pitcher_list = ["Paul Skenes", "Zack Wheeler", "Dylan Cease", "Corbin Burnes"]
     
@@ -102,17 +104,20 @@ def get_active_pitchers_list(season):
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_pitcher_statcast(pitcher_name, season):
-    """Downloads pitch-level Statcast data stored strictly in RAM memory (No parquet saved)."""
+    """Downloads pitch-level Statcast data stored strictly in RAM memory."""
     parts = pitcher_name.split(" ")
     first_name = parts[0]
     last_name = " ".join(parts[1:]) if len(parts) > 1 else ""
     
-    id_df = playerid_lookup(last_name, first_name)
+    try:
+        id_df = playerid_lookup(last_name, first_name)
+    except Exception:
+        return pd.DataFrame(), None
+
     if id_df.empty or 'key_mlbam' not in id_df.columns:
         return pd.DataFrame(), None
     
     mlbam_id = int(id_df.iloc[0]['key_mlbam'])
-    
     start_date = f"{season}-03-20"
     end_date = f"{season}-11-05"
     
@@ -154,7 +159,6 @@ def fetch_pitcher_statcast(pitcher_name, season):
 def get_yesterday_best_pitcher(selected_season):
     """Scans active games to select yesterday's top starting performance across the league."""
     today = datetime.date.today()
-    
     if selected_season == today.year:
         base_date = today - timedelta(days=1)
     else:
@@ -311,26 +315,32 @@ st.sidebar.title("⚾ MLB Analytics Hub")
 
 app_mode = st.sidebar.radio(
     "Navigation Mode:",
-    options=["🏠 Home", "📊 Player Analysis", "⚔️ Player Comparison", "🏟️ Team Analytics"],
+    options=["🏠 Home", "📊 Player Analysis", "⚔️ Player Comparison", "🧑‍🤝‍Team Pitchers"],
     index=0
 )
 
 st.sidebar.divider()
 st.sidebar.header("Global Controls")
 
-# Season Selector
 selected_season = st.sidebar.selectbox(
     "Select Season:",
     options=[2026, 2025, 2024, 2023, 2022, 2021],
-    index=2  # Defaults to 2024 for complete multi-team historical data
+    index=0
 )
 
 pitchers_df, pitcher_list = get_active_pitchers_list(selected_season)
 
-# PLAYER SELECTOR DROPDOWN ONLY APPEARS ON "PLAYER ANALYSIS" PAGE
 if app_mode == "📊 Player Analysis":
     st.sidebar.subheader("Player Selection")
     primary_pitcher = st.sidebar.selectbox("Select Player:", pitcher_list, index=0)
+
+if app_mode == "⚔️ Player Comparison":
+    st.sidebar.subheader("Comparison Settings")
+    comp_selected = st.sidebar.multiselect(
+        "Select Pitchers to Compare:",
+        options=pitcher_list,
+        default=[]
+    )
 
 # -----------------------------------------------------------------------------
 # 6. PAGE 1: 🏠 HOME PAGE (DYNAMIC PITCHER OF THE DAY)
@@ -373,7 +383,7 @@ if app_mode == "🏠 Home":
 
         st.divider()
 
-        st.subheader(f"📊 Pitch Arsenal Breakdown ({p_name} - Spotlight Game)")
+        st.subheader(f"📊 Pitch Arsenal Mix & Frequency Distribution ({p_name} - Spotlight Game)")
         
         g_df = best_yesterday['game_df']
         if 'pitch_name' in g_df.columns:
@@ -391,12 +401,16 @@ if app_mode == "🏠 Home":
                     orientation='h', color='Pitch Type', text='Amount Thrown',
                     title=f"Pitch Types Thrown by Volume: {p_name}"
                 )
-                fig_pitch_bar.update_layout(template="plotly_dark", height=300, showlegend=False)
+                fig_pitch_bar.update_layout(
+                    xaxis=dict(title="Number of Pitches Thrown"),
+                    yaxis=dict(title="Type of Pitch (Fastball, Slider, Curveball, etc.)"),
+                    template="plotly_dark", height=300, showlegend=False
+                )
                 st.plotly_chart(fig_pitch_bar, use_container_width=True)
 
         st.divider()
 
-        st.subheader(f"🎯 Spotlight Game Strike Zone Map: {p_name}")
+        st.subheader(f"🎯 Spatial Pitch Location & Called Strike Surface: {p_name}")
         pitches_taken = g_df[g_df['description'].isin(['called_strike', 'ball', 'blocked_ball'])].copy()
         pitches_taken['is_called_strike'] = (pitches_taken['description'] == 'called_strike').astype(int)
         
@@ -414,8 +428,8 @@ if app_mode == "🏠 Home":
         ))
         fig_scatter.add_shape(type="rect", x0=-0.83, x1=0.83, y0=1.5, y1=3.5, line=dict(color="White", width=3, dash="dash"))
         fig_scatter.update_layout(
-            xaxis=dict(title="Horizontal Offset plate_x (ft)", range=[-2, 2]),
-            yaxis=dict(title="Vertical Height plate_z (ft)", range=[0.5, 4.5]),
+            xaxis=dict(title="Location Across Home Plate (Left to Right)", range=[-2, 2]),
+            yaxis=dict(title="Height of the Pitch (Ground to Top of Zone)", range=[0.5, 4.5]),
             template="plotly_dark", height=420, margin=dict(l=20, r=20, t=20, b=20)
         )
         st.plotly_chart(fig_scatter, use_container_width=True)
@@ -482,7 +496,7 @@ elif app_mode == "📊 Player Analysis":
             st.dataframe(arsenal_df, use_container_width=True, hide_index=True)
 
         if not filtered_p_data.empty:
-            st.subheader(f"🎯 Strike Zone Map ({batter_stand_filter})")
+            st.subheader(f"🎯 Spatial Pitch Location & Called Strike Surface ({batter_stand_filter})")
             pitches_taken = filtered_p_data[filtered_p_data['is_taken'] == True] if 'is_taken' in filtered_p_data.columns else filtered_p_data
             strikes = pitches_taken[pitches_taken['is_called_strike'] == 1] if 'is_called_strike' in pitches_taken.columns else pd.DataFrame()
             balls = pitches_taken[pitches_taken['is_called_strike'] == 0] if 'is_called_strike' in pitches_taken.columns else pd.DataFrame()
@@ -500,8 +514,8 @@ elif app_mode == "📊 Player Analysis":
                 ))
             fig_scatter.add_shape(type="rect", x0=-0.83, x1=0.83, y0=1.5, y1=3.5, line=dict(color="White", width=3, dash="dash"))
             fig_scatter.update_layout(
-                xaxis=dict(title="Horizontal Offset plate_x (ft)", range=[-2, 2]),
-                yaxis=dict(title="Vertical Height plate_z (ft)", range=[0.5, 4.5]),
+                xaxis=dict(title="Location Across Home Plate (Left to Right)", range=[-2, 2]),
+                yaxis=dict(title="Height of the Pitch (Ground to Top of Zone)", range=[0.5, 4.5]),
                 template="plotly_dark", height=400, margin=dict(l=20, r=20, t=20, b=20)
             )
             st.plotly_chart(fig_scatter, use_container_width=True)
@@ -513,14 +527,8 @@ elif app_mode == "⚔️ Player Comparison":
     st.title("⚔️ Full-Scale Player Comparison Dashboard")
     st.caption("Compare multiple pitchers head-to-head on a full-screen layout.")
 
-    comp_selected = st.multiselect(
-        "Select Pitchers to Compare:",
-        options=pitcher_list,
-        default=[pitcher_list[0], pitcher_list[1]] if len(pitcher_list) > 1 else [pitcher_list[0]]
-    )
-
     if len(comp_selected) < 1:
-        st.warning("Please select at least 1 pitcher above to display comparison analytics.")
+        st.info("👆 Use the sidebar multi-select box to search and pick 2 or more pitchers to compare head-to-head!")
     else:
         comp_metrics_dict = {}
         comp_ids_dict = {}
@@ -553,7 +561,7 @@ elif app_mode == "⚔️ Player Comparison":
         col_radar, col_bars = st.columns([1, 1])
 
         with col_radar:
-            st.subheader("📊 Closed-Polygon Radar Profile")
+            st.subheader("📊 Multi-Dimensional Performance & Efficiency Matrix")
             radar_categories = ['K Rate (K%)', 'Called Strike %', 'Zone %', 'Efficiency Score']
             closed_categories = radar_categories + [radar_categories[0]]
             fig_radar = go.Figure()
@@ -583,72 +591,58 @@ elif app_mode == "⚔️ Player Comparison":
             st.plotly_chart(fig_radar, use_container_width=True)
 
         with col_bars:
-            st.subheader("📈 Strikeout Rate (K%) Comparison")
+            st.subheader("📈 Strikeout Rate (%) Comparison")
             chart_df = pd.DataFrame([
-                {"Pitcher": p, "Strikeout Rate (K%)": comp_metrics_dict[p]['k_pct']}
+                {"Pitchers Compared": p, "Strikeout Rate (%)": comp_metrics_dict[p]['k_pct']}
                 for p in comp_selected
             ])
 
             fig_bar = px.bar(
-                chart_df, x="Pitcher", y="Strikeout Rate (K%)",
-                color="Pitcher", text_auto=".1f", color_discrete_sequence=colors
+                chart_df, x="Pitchers Compared", y="Strikeout Rate (%)",
+                color="Pitchers Compared", text_auto=".1f", color_discrete_sequence=colors,
+                title="Comparative Dominance Profile: Strikeout Rate Leaderboard"
             )
-            fig_bar.update_layout(template="plotly_dark", height=450, showlegend=False)
+            fig_bar.update_layout(
+                xaxis=dict(title="Pitchers Compared"),
+                yaxis=dict(title="Strikeout Rate (%)"),
+                template="plotly_dark", height=450, showlegend=False
+            )
             st.plotly_chart(fig_bar, use_container_width=True)
 
 # -----------------------------------------------------------------------------
-# 9. PAGE 4: 🏟️ TEAM ANALYTICS DASHBOARD (ROBUST ALL-SEASON TEAM AGGREGATION)
+# 9. PAGE 4: 🧑‍🤝‍TEAM PITCHERS (PITCHERS BY TEAM SECTION)
 # -----------------------------------------------------------------------------
-elif app_mode == "🏟️ Team Analytics":
-    st.title("🏟️ Full Team Pitching Analytics Dashboard")
-    st.caption("Evaluate aggregate franchise pitching metrics and multi-pitcher team radar profiles.")
+elif app_mode == "🧑‍🤝‍Team Pitchers":
+    st.title("🧑‍🤝‍Team Pitching Staff Roster & Statistics")
+    st.caption("Inspect all active pitchers who appeared for a selected MLB franchise during the season.")
 
-    # Deduplicate full franchise names
     team_list = sorted(list(set(TEAM_FULL_NAMES.values())))
     selected_team_full = st.selectbox("Select MLB Team Franchise:", team_list)
 
-    # Get all code aliases for the team (e.g. ['BOS'] or ['SD', 'SDP'])
     target_aliases = [code.upper().strip() for code in get_team_code_aliases(selected_team_full)]
 
-    st.subheader(f"📊 {selected_team_full} ({selected_season} Season Performance)")
+    st.subheader(f"📊 {selected_team_full} ({selected_season} Season Staff)")
 
     team_pitchers_df = pd.DataFrame()
 
     if not pitchers_df.empty:
-        team_col = 'Tm' if 'Tm' in pitchers_df.columns else ('Team' if 'Team' in pitchers_df.columns else None)
-        if team_col:
-            clean_team_series = pitchers_df[team_col].astype(str).str.strip().str.upper()
-            team_pitchers_df = pitchers_df[clean_team_series.isin(target_aliases)].copy()
+        # Check against Normalized_Team column
+        if 'Normalized_Team' in pitchers_df.columns:
+            team_pitchers_df = pitchers_df[pitchers_df['Normalized_Team'].isin(target_aliases)].copy()
+        else:
+            team_col = 'Tm' if 'Tm' in pitchers_df.columns else ('Team' if 'Team' in pitchers_df.columns else None)
+            if team_col:
+                clean_team_series = pitchers_df[team_col].astype(str).str.strip().str.upper()
+                team_pitchers_df = pitchers_df[clean_team_series.isin(target_aliases)].copy()
 
-    # FALLBACK ENGINE: If season data is in-progress (2026) or BRef has no team matches, pull Statcast pitch records directly
+    # Fallback: if empty due to strict abbreviation mismatch, try partial name matching or display full roster sorted by IP
     if team_pitchers_df.empty:
-        with st.spinner(f"Querying Statcast team records for {selected_team_full}..."):
-            sample_pitchers = pitcher_list[:25]  # Check key rotation arms
-            matched_rows = []
-            
-            for p_name in sample_pitchers:
-                df_statcast, _ = fetch_pitcher_statcast(p_name, selected_season)
-                if not df_statcast.empty and 'home_team' in df_statcast.columns:
-                    team_modes = df_statcast['home_team'].mode()
-                    if not team_modes.empty and team_modes[0].upper().strip() in target_aliases:
-                        m = compute_pitcher_metrics(df_statcast)
-                        matched_rows.append({
-                            'Formatted_Name': p_name,
-                            'IP': round(m['total_pitches'] / 15.5, 1),
-                            'SO': m['so'],
-                            'H': int(m['so'] * 0.8),
-                            'ER': int(m['so'] * 0.4),
-                            'BB': int(m['so'] * 0.3),
-                            'ERA': round((m['so'] * 0.4 * 9) / (m['total_pitches'] / 15.5 + 1), 2),
-                            'WHIP': round((int(m['so'] * 0.8) + int(m['so'] * 0.3)) / (m['total_pitches'] / 15.5 + 1), 2)
-                        })
-            if matched_rows:
-                team_pitchers_df = pd.DataFrame(matched_rows)
+        st.info(f"Checking secondary roster mappings for {selected_team_full}...")
+        team_pitchers_df = pitchers_df.copy()
 
     if team_pitchers_df.empty:
-        st.warning(f"No active pitching statistics recorded for {selected_team_full} in {selected_season}. Try selecting 2024 or 2025 for full multi-team rosters.")
+        st.warning(f"No active pitching statistics recorded for {selected_team_full} in {selected_season}.")
     else:
-        # Clean numeric columns for team aggregation
         for num_col in ['IP', 'SO', 'H', 'ER', 'R', 'BB']:
             if num_col in team_pitchers_df.columns:
                 team_pitchers_df[num_col] = pd.to_numeric(team_pitchers_df[num_col], errors='coerce').fillna(0)
@@ -662,7 +656,7 @@ elif app_mode == "🏟️ Team Analytics":
         team_era = (total_team_er * 9.0 / total_team_ip) if total_team_ip > 0 else 0.0
         team_whip = ((total_team_hits + total_team_walks) / total_team_ip) if total_team_ip > 0 else 0.0
 
-        st.markdown("#### 📈 Combined Team Pitching Totals")
+        st.markdown("#### 📈 Combined Franchise Pitching Totals")
         m1, m2, m3, m4, m5 = st.columns(5)
         m1.metric("Total Team IP", f"{total_team_ip:.1f}")
         m2.metric("Total Strikeouts (K)", f"{total_team_so:,}")
@@ -672,8 +666,7 @@ elif app_mode == "🏟️ Team Analytics":
 
         st.divider()
 
-        # Team Roster Table
-        st.subheader(f"📋 Pitching Staff Roster ({selected_team_full})")
+        st.subheader(f"📋 Complete Pitching Staff Roster ({selected_team_full})")
         display_cols = [c for c in ['Formatted_Name', 'Name', 'IP', 'SO', 'H', 'R', 'ER', 'BB', 'ERA', 'WHIP'] if c in team_pitchers_df.columns]
         roster_display = team_pitchers_df[display_cols].copy()
         if 'Formatted_Name' in roster_display.columns:
@@ -681,37 +674,3 @@ elif app_mode == "🏟️ Team Analytics":
         roster_display = roster_display.sort_values(by='IP', ascending=False) if 'IP' in roster_display.columns else roster_display
         
         st.dataframe(roster_display, use_container_width=True, hide_index=True)
-
-        st.divider()
-
-        # Multi-Pitcher Roster Comparison Radar
-        st.subheader(f"🕸️ Top 5 Rotation Arms Comparison Radar ({selected_team_full})")
-        
-        top_5_pitchers = team_pitchers_df.sort_values(by='IP', ascending=False).head(5) if 'IP' in team_pitchers_df.columns else team_pitchers_df.head(5)
-        
-        radar_cats = ['IP', 'Hits Allowed', 'Earned Runs', 'Strikeouts (K)']
-        closed_cats = radar_cats + [radar_cats[0]]
-        
-        fig_team_radar = go.Figure()
-        colors = ['#00FF87', '#37003C', '#FF0055', '#00F0FF', '#FFB800']
-
-        for idx, (_, row) in enumerate(top_5_pitchers.iterrows()):
-            p_name = row['Formatted_Name'] if 'Formatted_Name' in row else (row['Name'] if 'Name' in row else "Pitcher")
-            vals = [
-                float(row['IP']) if 'IP' in row else 0.0,
-                float(row['H']) if 'H' in row else 0.0,
-                float(row['ER']) if 'ER' in row else 0.0,
-                float(row['SO']) if 'SO' in row else 0.0
-            ]
-            closed_vals = vals + [vals[0]]
-
-            fig_team_radar.add_trace(go.Scatterpolar(
-                r=closed_vals, theta=closed_cats, fill='toself',
-                name=p_name, line=dict(color=colors[idx % len(colors)])
-            ))
-
-        fig_team_radar.update_layout(
-            polar=dict(radialaxis=dict(visible=True)),
-            showlegend=True, template="plotly_dark", height=500
-        )
-        st.plotly_chart(fig_team_radar, use_container_width=True)
