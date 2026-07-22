@@ -77,6 +77,80 @@ def get_full_team_name(abbrev):
         return "Major League Baseball"
     return TEAM_FULL_NAMES.get(abbrev.upper().strip(), abbrev)
 
+PARK_SPEED_MULTIPLIER = {
+    "Colorado Rockies": 1.03,
+    "Arizona Diamondbacks": 1.02,
+    "San Diego Padres": 0.995,
+    "Seattle Mariners": 0.995,
+    "Miami Marlins": 0.995,
+    "Boston Red Sox": 0.99,
+    "New York Yankees": 0.99,
+    "Tampa Bay Rays": 0.99,
+    "Los Angeles Angels": 0.995,
+    "Houston Astros": 0.995,
+}
+
+PARK_ZONE_MULTIPLIER = {
+    "Colorado Rockies": 0.98,
+    "Arizona Diamondbacks": 0.99,
+    "San Diego Padres": 1.0,
+    "Seattle Mariners": 1.0,
+    "Miami Marlins": 1.0,
+    "Boston Red Sox": 1.01,
+    "New York Yankees": 1.0,
+    "Tampa Bay Rays": 1.0,
+    "Los Angeles Angels": 1.0,
+    "Houston Astros": 1.0,
+}
+
+def get_park_multiplier(team_value, metric='speed'):
+    team_name = normalize_team_name(team_value)
+    if metric == 'zone':
+        return PARK_ZONE_MULTIPLIER.get(team_name, 1.0)
+    return PARK_SPEED_MULTIPLIER.get(team_name, 1.0)
+
+
+def compute_park_adjusted_metrics(df_p):
+    if df_p.empty:
+        return {
+            "avg_speed": 0.0,
+            "avg_spin": 0.0,
+            "zone_pct": 0.0,
+            "park_note": "No park data available"
+        }
+
+    avg_speed = float(df_p['release_speed'].dropna().mean()) if 'release_speed' in df_p.columns else 0.0
+    avg_spin = float(df_p['release_spin_rate'].dropna().mean()) if 'release_spin_rate' in df_p.columns else 0.0
+    zone_pct = float(df_p['is_in_zone'].sum() / len(df_p) * 100) if 'is_in_zone' in df_p.columns and len(df_p) > 0 else 0.0
+
+    if 'home_team' in df_p.columns:
+        speed_factors = df_p['home_team'].fillna('').map(lambda x: get_park_multiplier(x, 'speed'))
+        zone_factors = df_p['home_team'].fillna('').map(lambda x: get_park_multiplier(x, 'zone'))
+        if not speed_factors.empty:
+            speed_factor = speed_factors.mean()
+            avg_speed = round(avg_speed * speed_factor, 1)
+            avg_spin = round(avg_spin * speed_factor, 0)
+        else:
+            avg_speed = round(avg_speed, 1)
+            avg_spin = round(avg_spin, 0)
+        if not zone_factors.empty:
+            zone_pct = round(zone_pct * zone_factors.mean(), 1)
+        else:
+            zone_pct = round(zone_pct, 1)
+        park_note = "Park-adjusted using venue-level factors."
+    else:
+        avg_speed = round(avg_speed, 1)
+        avg_spin = round(avg_spin, 0)
+        zone_pct = round(zone_pct, 1)
+        park_note = "Park adjustment unavailable without home team data."
+
+    return {
+        "avg_speed": avg_speed,
+        "avg_spin": avg_spin,
+        "zone_pct": zone_pct,
+        "park_note": park_note
+    }
+
 
 def normalize_team_name(team_value):
     """Normalize MLB team values to a canonical franchise name."""
@@ -215,6 +289,27 @@ def get_live_mlb_schedule(target_date=None):
     if not payload:
         return pd.DataFrame(columns=["game_pk", "home_team", "away_team", "home_score", "away_score", "status", "inning", "outs", "is_live", "venue", "game_time"])
 
+    def _format_inning_label(linescore, status):
+        if not linescore:
+            return ""
+        if isinstance(status, str) and status.lower().startswith("final"):
+            return "Final"
+        inning_state = linescore.get("inningState") or ""
+        inning_ordinal = linescore.get("currentInningOrdinal") or linescore.get("currentInning") or ""
+        if inning_state:
+            return f"{inning_state} {inning_ordinal}".strip()
+        return str(inning_ordinal) if inning_ordinal else ""
+
+    def _is_live_state(status, linescore):
+        if not isinstance(status, str):
+            status = ""
+        lower = status.lower()
+        if any(token in lower for token in ["in progress", "live", "warmup", "delayed"]):
+            return True
+        if linescore.get("currentInning") or linescore.get("currentInningOrdinal"):
+            return not lower.startswith("final")
+        return False
+
     games = []
     for date_entry in payload.get("dates", []):
         for game in date_entry.get("games", []):
@@ -224,10 +319,9 @@ def get_live_mlb_schedule(target_date=None):
             away_team = game.get("teams", {}).get("away", {}).get("team", {}).get("name", "Unknown")
             home_score = game.get("teams", {}).get("home", {}).get("score")
             away_score = game.get("teams", {}).get("away", {}).get("score")
-            inning = linescore.get("currentInning") or linescore.get("currentInningOrdinal") or ""
             outs = linescore.get("outs") or ""
-            inning_state = linescore.get("inningState") or ""
-            is_live = status.lower() in {"in progress", "live", "delayed", "warmup"} or bool(linescore)
+            inning_label = _format_inning_label(linescore, status)
+            is_live = _is_live_state(status, linescore)
 
             games.append({
                 "game_pk": game.get("gamePk"),
@@ -236,7 +330,7 @@ def get_live_mlb_schedule(target_date=None):
                 "home_score": home_score if home_score is not None else 0,
                 "away_score": away_score if away_score is not None else 0,
                 "status": status,
-                "inning": f"{inning_state} {inning}".strip() if inning_state else str(inning) if inning else "",
+                "inning": inning_label,
                 "outs": outs,
                 "is_live": is_live,
                 "venue": game.get("venue", {}).get("name", ""),
@@ -1286,21 +1380,35 @@ if app_mode == "⚡ Live Games":
         scoreboard = live_games_df.copy()
         scoreboard["matchup"] = scoreboard["away_team"] + " @ " + scoreboard["home_team"]
         scoreboard["scoreline"] = scoreboard["away_score"].astype(str) + " - " + scoreboard["home_score"].astype(str)
-        scoreboard = scoreboard[["game_pk", "matchup", "scoreline", "status", "inning", "outs", "is_live", "venue"]]
-        st.subheader("📊 Today’s Scoreboard")
-        st.dataframe(scoreboard, hide_index=True, use_container_width=True)
 
-        live_games = scoreboard[scoreboard["is_live"]].copy()
+        def _display_status(row):
+            status = str(row["status"] or "").strip()
+            if row["is_live"]:
+                return f"🟢 {status or 'In Progress'}"
+            if status.lower().startswith("final"):
+                return "🔴 Final"
+            start_time = pd.to_datetime(row["game_time"], utc=True, errors="coerce")
+            if not pd.isna(start_time):
+                return f"🕒 {start_time.strftime('%I:%M %p')}"
+            return f"⚪ {status or 'Scheduled'}"
+
+        scoreboard["display_status"] = scoreboard.apply(_display_status, axis=1)
+        scoreboard = scoreboard[["game_pk", "matchup", "scoreline", "display_status", "inning", "outs", "venue"]]
+        st.subheader("📊 Today’s Scoreboard")
+        st.dataframe(scoreboard.rename(columns={"display_status": "status"}), hide_index=True, use_container_width=True)
+
+        live_games = scoreboard[scoreboard["display_status"].str.contains("🟢")].copy()
         if live_games.empty:
             live_games = scoreboard.head(8).copy()
             st.info("There are no games currently in progress, so the most recent matchups are shown below.")
 
         st.markdown("### 🧾 Click a matchup to open the live intelligence view")
         for _, row in live_games.iterrows():
-            button_label = f"{row['matchup']} • {row['scoreline']} • {row['status']}"
+            button_label = f"{row['matchup']} • {row['scoreline']} • {row['display_status']}"
             if st.button(button_label, key=f"live_game_{row['game_pk']}", use_container_width=True):
                 st.session_state.selected_live_game_pk = int(row["game_pk"])
 
+        # Respect previously-selected game, otherwise default to the first live matchup
         selected_game_pk = st.session_state.get("selected_live_game_pk")
         if selected_game_pk is None and not live_games.empty:
             selected_game_pk = int(live_games.iloc[0]["game_pk"])
@@ -1319,14 +1427,23 @@ if app_mode == "⚡ Live Games":
                 else:
                     home_team = game_info["home_team"]
                     away_team = game_info["away_team"]
+                    status_badge = "🟢 Live" if game_info["is_live"] else ("🔴 Final" if str(game_info["status"]).lower().startswith("final") else "🕒 Upcoming")
                     st.subheader(f"🧠 {away_team} @ {home_team}")
-                    st.caption(f"Status: {game_info['status']} • Venue: {game_info['venue']}")
+                    st.caption(f"Status: {status_badge} • {game_info['status']} • Venue: {game_info['venue']}")
 
                     c1, c2, c3, c4 = st.columns(4)
                     c1.metric("Score", f"{game_info['away_score']} - {game_info['home_score']}")
-                    c2.metric("Inning / Outs", f"{game_info['inning']} • {game_info['outs']} outs")
+                    c2.metric("Inning / Outs", f"{game_info['inning'] or 'N/A'} • {game_info['outs'] or 'N/A'} outs")
                     c3.metric("Live", "Yes" if game_info["is_live"] else "No")
                     c4.metric("Venue", game_info["venue"] or "Unknown")
+
+                    pitcher_lines = []
+                    if live_game.get("away_pitchers"):
+                        pitcher_lines.append("Away: " + ", ".join(live_game.get("away_pitchers", [])))
+                    if live_game.get("home_pitchers"):
+                        pitcher_lines.append("Home: " + ", ".join(live_game.get("home_pitchers", [])))
+                    if pitcher_lines:
+                        st.caption("Probable pitchers: " + " | ".join(pitcher_lines))
 
                     latest_play = None
                     for play in live_game.get("plays", []) or []:
@@ -1727,6 +1844,8 @@ elif app_mode == "📊 Player Analysis":
             st.session_state.player_analysis_context_mode = 'Raw totals'
         if 'player_analysis_context_split' not in st.session_state:
             st.session_state.player_analysis_context_split = 'Home'
+        if 'player_analysis_park_choice' not in st.session_state:
+            st.session_state.player_analysis_park_choice = 'All parks'
 
         context_mode = st.radio(
             'Context behavior',
@@ -1737,6 +1856,7 @@ elif app_mode == "📊 Player Analysis":
 
         context_data = primary_data.copy()
         context_note = 'Raw totals'
+        park_adjustment_note = ''
 
         if not context_data.empty:
             if context_mode == 'Home/Away splits':
@@ -1750,24 +1870,41 @@ elif app_mode == "📊 Player Analysis":
                         context_data = context_data[context_data['inning_topbot'].astype(str).str.lower().str.contains('bottom', na=False)]
                     else:
                         context_data = context_data[context_data['inning_topbot'].astype(str).str.lower().str.contains('top', na=False)]
+                elif split_choice == 'Home' and 'home_team' in context_data.columns:
+                    context_data = context_data[context_data['home_team'].notna() & (context_data['home_team'].astype(str) != '')]
+                elif split_choice == 'Away' and 'away_team' in context_data.columns:
+                    context_data = context_data[context_data['away_team'].notna() & (context_data['away_team'].astype(str) != '')]
                 context_note = f'{split_choice} split'
-            elif context_mode == 'Park-adjusted':
-                context_note = 'Park-adjusted view'
 
-        context_metrics = {
-            'avg_speed': round(context_data['release_speed'].mean(), 1) if 'release_speed' in context_data.columns and not context_data.empty else 0.0,
-            'avg_spin': round(context_data['release_spin_rate'].mean(), 0) if 'release_spin_rate' in context_data.columns and not context_data.empty else 0.0,
-            'zone_pct': round((context_data['is_in_zone'].sum() / len(context_data) * 100) if 'is_in_zone' in context_data.columns and not context_data.empty else 0.0, 1)
-        }
+            elif context_mode == 'Park-adjusted':
+                park_choice = st.selectbox(
+                    'Select park filter:',
+                    ['All parks', 'Home parks only', 'Away parks only'],
+                    key='player_analysis_park_choice'
+                )
+                if park_choice == 'Home parks only' and 'home_team' in context_data.columns:
+                    context_data = context_data[context_data['home_team'].notna() & (context_data['home_team'].astype(str) != '')]
+                elif park_choice == 'Away parks only' and 'away_team' in context_data.columns:
+                    context_data = context_data[context_data['away_team'].notna() & (context_data['away_team'].astype(str) != '')]
+                context_note = f'{park_choice} • Park-adjusted'
+                park_adjustment_note = 'Venue-level park factors are applied for this view.'
 
         if context_mode == 'Park-adjusted':
-            context_metrics['avg_speed'] = round(context_metrics['avg_speed'] * 1.005, 1)
-            context_metrics['avg_spin'] = round(context_metrics['avg_spin'] * 1.005, 0)
+            context_metrics = compute_park_adjusted_metrics(context_data)
+        else:
+            context_metrics = {
+                'avg_speed': round(context_data['release_speed'].mean(), 1) if 'release_speed' in context_data.columns and not context_data.empty else 0.0,
+                'avg_spin': round(context_data['release_spin_rate'].mean(), 0) if 'release_spin_rate' in context_data.columns and not context_data.empty else 0.0,
+                'zone_pct': round((context_data['is_in_zone'].sum() / len(context_data) * 100) if 'is_in_zone' in context_data.columns and not context_data.empty else 0.0, 1)
+            }
 
-        c1, c2, c3 = st.columns(3)
+        c1, c2, c3, c4 = st.columns(4)
         c1.metric('Context Mode', context_mode)
         c2.metric('Avg Release Velo', f"{context_metrics['avg_speed']:.1f} mph")
-        c3.metric('In-Zone %', f"{context_metrics['zone_pct']:.1f}%")
+        c3.metric('Avg Spin Rate', f"{context_metrics['avg_spin']:.0f} rpm")
+        c4.metric('In-Zone %', f"{context_metrics['zone_pct']:.1f}%")
+        if context_mode == 'Park-adjusted':
+            st.caption(park_adjustment_note or context_metrics.get('park_note', ''))
         st.caption(f'{context_note} metrics based on {len(context_data)} pitches.')
 
     with tab_zone:
