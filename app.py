@@ -1419,7 +1419,9 @@ def compute_percentile_leaderboard(df_p, statcast_df):
     fastball_tags = {"FF", "FA", "FFB", "Four-Seam Fastball", "4-Seam Fastball"}
     sc["is_fastball"] = sc.get("pitch_type", sc.get("pitch_name", "")).astype(str).isin(fastball_tags)
 
-    agg = sc.groupby("pitcher", as_index=False).agg({
+    group_name_col = "player_name" if "player_name" in sc.columns else "pitcher"
+
+    agg = sc.groupby(group_name_col, as_index=False).agg({
         "whiff": "sum",
         "swing": "sum",
         "chase_swing": "sum",
@@ -1435,10 +1437,18 @@ def compute_percentile_leaderboard(df_p, statcast_df):
     agg["FastballVelo_pct"] = (agg["FastballVelo"].rank(pct=True) * 100).round(0)
     agg["ChaseRate_pct"] = (agg["ChaseRate"].rank(pct=True) * 100).round(0)
 
+    if group_name_col == "player_name":
+        agg['Formatted_Name'] = agg['player_name'].apply(format_name_first_last)
+        merge_col = "Formatted_Name"
+    else:
+        merge_col = group_name_col
+
+    df_merge_col = 'Pitcher' if 'Pitcher' in df_p.columns else 'Formatted_Name'
+
     return df_p.merge(
-        agg[["pitcher", "WhiffRate_pct", "FastballVelo_pct", "ChaseRate_pct"]],
-        left_on="pitcher", right_on="pitcher", how="left"
-    )
+        agg[[merge_col, "WhiffRate_pct", "FastballVelo_pct", "ChaseRate_pct"]],
+        left_on=df_merge_col, right_on=merge_col, how="left"
+    ).drop(columns=[merge_col], errors='ignore')
 
 st.sidebar.markdown(
     """
