@@ -290,23 +290,34 @@ def build_live_pitch_log(live_game):
     if not live_game:
         return pd.DataFrame(columns=["Inning", "Description", "Count", "Pitch Type", "Velocity", "Pitcher", "Batter"])
 
+    def _normalize_pitch_name(raw_pitch_name):
+        if isinstance(raw_pitch_name, dict):
+            return str(raw_pitch_name.get("description") or raw_pitch_name.get("code") or "Unknown").strip()
+        if isinstance(raw_pitch_name, str):
+            return raw_pitch_name.strip() or "Unknown"
+        return str(raw_pitch_name).strip() or "Unknown"
+
     rows = []
     for play in live_game.get("plays", []) or []:
         about = play.get("about", {}) or {}
         result = play.get("result", {}) or {}
         description = result.get("description") or about.get("description") or "Play"
+        if isinstance(description, (dict, list)):
+            description = json.dumps(description, ensure_ascii=False)
+        else:
+            description = str(description)
         inning = about.get("halfInning") or ""
         inning_label = f"{about.get('inning', '')}{' ' + inning if inning else ''}".strip()
         count = about.get("count") or {}
         count_label = f"{count.get('balls', '?')}-{count.get('strikes', '?')}"
 
-        pitch_type = ""
+        pitch_type = "Unknown"
         velocity = None
         for event in play.get("playEvents", []) or []:
             event_details = event.get("details", {}) or {}
             raw_pitch_name = event_details.get("pitchType") or event_details.get("pitchName") or event_details.get("type") or ""
-            pitch_name = str(raw_pitch_name).strip() if raw_pitch_name is not None else ""
-            if pitch_name and pitch_type == "":
+            pitch_name = _normalize_pitch_name(raw_pitch_name)
+            if pitch_name and pitch_type == "Unknown":
                 pitch_type = pitch_name
             pitch_data = event.get("pitchData", {}) or {}
             speed = pitch_data.get("startSpeed")
@@ -337,6 +348,13 @@ def summarize_live_game(live_game):
             "latest_result": "No live play data available"
         }
 
+    def _normalize_pitch_name(raw_pitch_name):
+        if isinstance(raw_pitch_name, dict):
+            return str(raw_pitch_name.get("description") or raw_pitch_name.get("code") or "Unknown").strip()
+        if isinstance(raw_pitch_name, str):
+            return raw_pitch_name.strip() or "Unknown"
+        return str(raw_pitch_name).strip() or "Unknown"
+
     plays = live_game.get("plays", []) or []
     count_counter = Counter()
     velocity_values = []
@@ -345,12 +363,16 @@ def summarize_live_game(live_game):
     for play in plays[:20]:
         result = play.get("result", {}) or {}
         description = result.get("description") or play.get("about", {}).get("description") or ""
+        if isinstance(description, (dict, list)):
+            description = json.dumps(description, ensure_ascii=False)
+        else:
+            description = str(description)
         if description:
             latest_result = description
         for event in play.get("playEvents", []) or []:
             details = event.get("details", {}) or {}
             raw_pitch_name = details.get("pitchType") or details.get("pitchName") or details.get("type") or ""
-            pitch_name = str(raw_pitch_name).strip() if raw_pitch_name is not None else ""
+            pitch_name = _normalize_pitch_name(raw_pitch_name)
             if pitch_name:
                 count_counter[pitch_name] += 1
             pitch_data = event.get("pitchData", {}) or {}
@@ -374,6 +396,13 @@ def build_live_zone_scatter(live_game):
     if not live_game:
         return pd.DataFrame(columns=["x", "y", "description"])
 
+    def _normalize_pitch_name(raw_pitch_name):
+        if isinstance(raw_pitch_name, dict):
+            return str(raw_pitch_name.get("description") or raw_pitch_name.get("code") or "Unknown").strip()
+        if isinstance(raw_pitch_name, str):
+            return raw_pitch_name.strip() or "Unknown"
+        return str(raw_pitch_name).strip() or "Unknown"
+
     rows = []
     for play in live_game.get("plays", []) or []:
         for event in play.get("playEvents", []) or []:
@@ -384,10 +413,12 @@ def build_live_zone_scatter(live_game):
             if x is None or y is None:
                 continue
             details = event.get("details", {}) or {}
+            raw_pitch_name = details.get("pitchType") or details.get("pitchName") or details.get("type") or details.get("description") or ""
+            pitch_name = _normalize_pitch_name(raw_pitch_name)
             rows.append({
                 "x": x,
                 "y": y,
-                "description": details.get("description", "Pitch")
+                "description": pitch_name
             })
 
     return pd.DataFrame(rows)
