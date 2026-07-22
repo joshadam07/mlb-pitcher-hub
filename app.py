@@ -304,12 +304,13 @@ def build_live_pitch_log(live_game):
         velocity = None
         for event in play.get("playEvents", []) or []:
             event_details = event.get("details", {}) or {}
-            pitch_name = event_details.get("pitchType") or event_details.get("pitchName") or event_details.get("type") or ""
-            if pitch_name:
+            raw_pitch_name = event_details.get("pitchType") or event_details.get("pitchName") or event_details.get("type") or ""
+            pitch_name = str(raw_pitch_name).strip() if raw_pitch_name is not None else ""
+            if pitch_name and pitch_type == "":
                 pitch_type = pitch_name
             pitch_data = event.get("pitchData", {}) or {}
             speed = pitch_data.get("startSpeed")
-            if speed is not None:
+            if isinstance(speed, (int, float)):
                 velocity = speed
                 break
 
@@ -348,7 +349,8 @@ def summarize_live_game(live_game):
             latest_result = description
         for event in play.get("playEvents", []) or []:
             details = event.get("details", {}) or {}
-            pitch_name = details.get("pitchType") or details.get("pitchName") or details.get("type") or ""
+            raw_pitch_name = details.get("pitchType") or details.get("pitchName") or details.get("type") or ""
+            pitch_name = str(raw_pitch_name).strip() if raw_pitch_name is not None else ""
             if pitch_name:
                 count_counter[pitch_name] += 1
             pitch_data = event.get("pitchData", {}) or {}
