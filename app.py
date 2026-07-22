@@ -297,19 +297,45 @@ def build_live_pitch_log(live_game):
             return raw_pitch_name.strip() or "Unknown"
         return str(raw_pitch_name).strip() or "Unknown"
 
+    def _extract_count(play):
+        about = play.get("about", {}) or {}
+        count = about.get("count", {}) or {}
+        balls = count.get("balls")
+        strikes = count.get("strikes")
+        if balls is not None or strikes is not None:
+            balls = balls if balls is not None else "?"
+            strikes = strikes if strikes is not None else "?"
+            return f"{balls}-{strikes}"
+
+        for event in reversed(play.get("playEvents", []) or []):
+            event_count = event.get("count") or event.get("about", {}).get("count") or {}
+            balls = event_count.get("balls")
+            strikes = event_count.get("strikes")
+            if balls is not None or strikes is not None:
+                balls = balls if balls is not None else "?"
+                strikes = strikes if strikes is not None else "?"
+                return f"{balls}-{strikes}"
+
+        return "?-?"
+
+    def _normalize_description(raw_description):
+        if isinstance(raw_description, dict):
+            raw_description = raw_description.get("description") or raw_description.get("code") or "Play"
+        elif isinstance(raw_description, list):
+            raw_description = " ".join(str(x) for x in raw_description if x)
+        else:
+            raw_description = str(raw_description)
+        text = raw_description.split("\n")[0].strip()
+        return text[:120].rstrip() if len(text) > 120 else text
+
     rows = []
     for play in live_game.get("plays", []) or []:
         about = play.get("about", {}) or {}
         result = play.get("result", {}) or {}
-        description = result.get("description") or about.get("description") or "Play"
-        if isinstance(description, (dict, list)):
-            description = json.dumps(description, ensure_ascii=False)
-        else:
-            description = str(description)
+        description = _normalize_description(result.get("description") or about.get("description") or "Play")
         inning = about.get("halfInning") or ""
         inning_label = f"{about.get('inning', '')}{' ' + inning if inning else ''}".strip()
-        count = about.get("count") or {}
-        count_label = f"{count.get('balls', '?')}-{count.get('strikes', '?')}"
+        count_label = _extract_count(play)
 
         pitch_type = "Unknown"
         velocity = None
@@ -355,36 +381,46 @@ def summarize_live_game(live_game):
             return raw_pitch_name.strip() or "Unknown"
         return str(raw_pitch_name).strip() or "Unknown"
 
+    def _shorten_text(raw_description):
+        if isinstance(raw_description, dict):
+            raw_description = raw_description.get("description") or raw_description.get("code") or ""
+        elif isinstance(raw_description, list):
+            raw_description = " ".join(str(x) for x in raw_description if x)
+        else:
+            raw_description = str(raw_description)
+        text = raw_description.replace("\n", " ").strip()
+        if "." in text:
+            text = text.split(".")[0].strip()
+        return text[:120].rstrip() if len(text) > 120 else text
+
     plays = live_game.get("plays", []) or []
     count_counter = Counter()
     velocity_values = []
+    recent_pitch_count = 0
     latest_result = "No live play data available"
 
     for play in plays[:20]:
         result = play.get("result", {}) or {}
-        description = result.get("description") or play.get("about", {}).get("description") or ""
-        if isinstance(description, (dict, list)):
-            description = json.dumps(description, ensure_ascii=False)
-        else:
-            description = str(description)
+        description = _shorten_text(result.get("description") or play.get("about", {}).get("description") or "")
         if description:
             latest_result = description
         for event in play.get("playEvents", []) or []:
+            recent_pitch_count += 1
             details = event.get("details", {}) or {}
             raw_pitch_name = details.get("pitchType") or details.get("pitchName") or details.get("type") or ""
             pitch_name = _normalize_pitch_name(raw_pitch_name)
-            if pitch_name:
+            if pitch_name and pitch_name != "Unknown":
                 count_counter[pitch_name] += 1
             pitch_data = event.get("pitchData", {}) or {}
             speed = pitch_data.get("startSpeed")
             if isinstance(speed, (int, float)):
                 velocity_values.append(float(speed))
 
-    pitch_mix = [f"{name} x{count}" for name, count in count_counter.most_common(4)]
+    pitch_mix = [f"{name} x{count}" for name, count in count_counter.most_common(3)]
     avg_velocity = round(sum(velocity_values) / len(velocity_values), 1) if velocity_values else None
 
     return {
-        "recent_pitch_count": len(velocity_values),
+        "recent_pitch_count": recent_pitch_count,
         "pitch_mix": pitch_mix,
         "avg_velocity": avg_velocity,
         "latest_result": latest_result
@@ -1687,23 +1723,52 @@ elif app_mode == "📊 Player Analysis":
                 st.plotly_chart(game_scatter, use_container_width=True)
 
     with tab_context:
-        context_mode = st.radio('Context behavior', ['Raw totals', 'Home/Away splits', 'Park-adjusted'], horizontal=True)
+        if 'player_analysis_context_mode' not in st.session_state:
+            st.session_state.player_analysis_context_mode = 'Raw totals'
+        if 'player_analysis_context_split' not in st.session_state:
+            st.session_state.player_analysis_context_split = 'Home'
+
+        context_mode = st.radio(
+            'Context behavior',
+            ['Raw totals', 'Home/Away splits', 'Park-adjusted'],
+            horizontal=True,
+            key='player_analysis_context_mode'
+        )
+
+        context_data = primary_data.copy()
+        context_note = 'Raw totals'
+
+        if not context_data.empty:
+            if context_mode == 'Home/Away splits':
+                split_choice = st.selectbox(
+                    'Select split:',
+                    ['Home', 'Away'],
+                    key='player_analysis_context_split'
+                )
+                if 'inning_topbot' in context_data.columns:
+                    if split_choice == 'Home':
+                        context_data = context_data[context_data['inning_topbot'].astype(str).str.lower().str.contains('bottom', na=False)]
+                    else:
+                        context_data = context_data[context_data['inning_topbot'].astype(str).str.lower().str.contains('top', na=False)]
+                context_note = f'{split_choice} split'
+            elif context_mode == 'Park-adjusted':
+                context_note = 'Park-adjusted view'
+
         context_metrics = {
-            'avg_speed': round(primary_data['release_speed'].mean(), 1) if 'release_speed' in primary_data.columns else 0.0,
-            'avg_spin': round(primary_data['release_spin_rate'].mean(), 0) if 'release_spin_rate' in primary_data.columns else 0.0,
-            'zone_pct': round((primary_data['is_in_zone'].sum() / len(primary_data) * 100) if 'is_in_zone' in primary_data.columns and not primary_data.empty else 0.0, 1)
+            'avg_speed': round(context_data['release_speed'].mean(), 1) if 'release_speed' in context_data.columns and not context_data.empty else 0.0,
+            'avg_spin': round(context_data['release_spin_rate'].mean(), 0) if 'release_spin_rate' in context_data.columns and not context_data.empty else 0.0,
+            'zone_pct': round((context_data['is_in_zone'].sum() / len(context_data) * 100) if 'is_in_zone' in context_data.columns and not context_data.empty else 0.0, 1)
         }
+
         if context_mode == 'Park-adjusted':
             context_metrics['avg_speed'] = round(context_metrics['avg_speed'] * 1.005, 1)
             context_metrics['avg_spin'] = round(context_metrics['avg_spin'] * 1.005, 0)
-        elif context_mode == 'Home/Away splits':
-            context_metrics['avg_speed'] = round(context_metrics['avg_speed'], 1)
-            context_metrics['avg_spin'] = round(context_metrics['avg_spin'], 0)
+
         c1, c2, c3 = st.columns(3)
         c1.metric('Context Mode', context_mode)
         c2.metric('Avg Release Velo', f"{context_metrics['avg_speed']:.1f} mph")
         c3.metric('In-Zone %', f"{context_metrics['zone_pct']:.1f}%")
-        st.caption('The contextual layer is now wired as a filterable module that can be expanded for park-adjusted or split-based views.')
+        st.caption(f'{context_note} metrics based on {len(context_data)} pitches.')
 
     with tab_zone:
         count_state_filter = st.selectbox('Count state filter', ['All', 'Ahead', 'Behind', 'Other'])
