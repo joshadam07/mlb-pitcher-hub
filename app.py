@@ -1,12 +1,17 @@
+import codecs
 import duckdb
 import datetime
+from collections import Counter
 from datetime import timedelta
+import json
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
 from pybaseball import cache, pitching_stats_bref, statcast, statcast_pitcher, playerid_lookup
 import streamlit as st
+import urllib.request
+from urllib.error import HTTPError, URLError
 
 # 1. Enable PyBaseball In-Memory Network Caching
 cache.enable()
@@ -37,30 +42,393 @@ TEAM_FULL_NAMES = {
     'WSN': 'Washington Nationals', 'WAS': 'Washington Nationals', 'NAT': 'Washington Nationals'
 }
 
+DEFAULT_MIN_PITCHES = 300
+
+
+def normalize_app_mode(mode):
+    """Normalize sidebar mode values so older or odd character variants still map correctly."""
+    if not isinstance(mode, str):
+        return "🏠 Home"
+
+    cleaned = mode.strip().replace("�", "")
+    if not cleaned:
+        return "🏠 Home"
+
+    lowered = cleaned.lower()
+    if "advanced" in lowered or "scouting" in lowered:
+        return "🔬 Advanced Scouting"
+    if "leader" in lowered:
+        return "📈 Leaderboards"
+    if "comparison" in lowered or "compare" in lowered:
+        return "⚔️ Player Comparison"
+    if "team" in lowered and "pitch" in lowered:
+        return "🧑‍🤝‍Team Pitchers"
+    if "live" in lowered:
+        return "⚡ Live Games"
+    if "player" in lowered and "analysis" in lowered:
+        return "📊 Player Analysis"
+    if "home" in lowered:
+        return "🏠 Home"
+    return cleaned
+
+
 def get_full_team_name(abbrev):
     if not isinstance(abbrev, str):
         return "Major League Baseball"
     return TEAM_FULL_NAMES.get(abbrev.upper().strip(), abbrev)
 
+
+def normalize_team_name(team_value):
+    """Normalize MLB team values to a canonical franchise name."""
+    if not isinstance(team_value, str):
+        return "Major League Baseball"
+
+    raw_value = team_value.split("<")[0].strip()
+    if not raw_value:
+        return "Major League Baseball"
+
+    raw_value = raw_value.replace("–", "-").replace("—", "-")
+    raw_value = raw_value.split(" (")[0].strip()
+
+    upper_value = raw_value.upper()
+    if upper_value in TEAM_FULL_NAMES:
+        return TEAM_FULL_NAMES[upper_value]
+
+    for full_name in TEAM_FULL_NAMES.values():
+        if full_name.upper() == upper_value:
+            return full_name
+
+    shorthand_mappings = {
+        "ARIZONA": "Arizona Diamondbacks",
+        "ATLANTA": "Atlanta Braves",
+        "BALTIMORE": "Baltimore Orioles",
+        "BOSTON": "Boston Red Sox",
+        "CHICAGO": ["Chicago Cubs", "Chicago White Sox"],
+        "CHICAGO CUBS": "Chicago Cubs",
+        "CHICAGO WHITE SOX": "Chicago White Sox",
+        "CINCINNATI": "Cincinnati Reds",
+        "CLEVELAND": "Cleveland Guardians",
+        "COLORADO": "Colorado Rockies",
+        "DETROIT": "Detroit Tigers",
+        "HOUSTON": "Houston Astros",
+        "KANSAS CITY": "Kansas City Royals",
+        "LOS ANGELES ANGELS": "Los Angeles Angels",
+        "LOS ANGELES DODGERS": "Los Angeles Dodgers",
+        "MIAMI": "Miami Marlins",
+        "MILWAUKEE": "Milwaukee Brewers",
+        "MINNESOTA": "Minnesota Twins",
+        "NEW YORK": ["New York Mets", "New York Yankees"],
+        "NEW YORK METS": "New York Mets",
+        "NEW YORK YANKEES": "New York Yankees",
+        "OAKLAND": "Oakland Athletics",
+        "PHILADELPHIA": "Philadelphia Phillies",
+        "PITTSBURGH": "Pittsburgh Pirates",
+        "SAN DIEGO": "San Diego Padres",
+        "SAN FRANCISCO": "San Francisco Giants",
+        "SEATTLE": "Seattle Mariners",
+        "ST. LOUIS": "St. Louis Cardinals",
+        "TAMPA BAY": "Tampa Bay Rays",
+        "TEXAS": "Texas Rangers",
+        "TORONTO": "Toronto Blue Jays",
+        "WASHINGTON": "Washington Nationals",
+    }
+    if upper_value in shorthand_mappings:
+        mapped_value = shorthand_mappings[upper_value]
+        if isinstance(mapped_value, list):
+            return mapped_value[0]
+        return mapped_value
+
+    for full_name in TEAM_FULL_NAMES.values():
+        if full_name.upper() in upper_value:
+            return full_name
+
+    return raw_value
+
+
+def normalize_team_candidates(team_value):
+    """Return one or more canonical team names from a raw value such as 'Minnesota,Philadelphia'."""
+    if not isinstance(team_value, str):
+        return []
+
+    raw_value = team_value.split("<")[0].strip()
+    if not raw_value:
+        return []
+
+    parts = [part.strip() for part in raw_value.replace(";", ",").split(",") if part.strip()]
+    candidates = []
+    for part in parts:
+        upper_value = part.upper()
+        if upper_value in TEAM_FULL_NAMES:
+            candidates.append(TEAM_FULL_NAMES[upper_value])
+            continue
+        for full_name in TEAM_FULL_NAMES.values():
+            if full_name.upper() == upper_value:
+                candidates.append(full_name)
+                break
+        else:
+            shorthand_mappings = {
+                "CHICAGO": ["Chicago Cubs", "Chicago White Sox"],
+                "NEW YORK": ["New York Mets", "New York Yankees"],
+                "MINNESOTA": ["Minnesota Twins"],
+                "PHILADELPHIA": ["Philadelphia Phillies"],
+                "MILWAUKEE": ["Milwaukee Brewers"],
+                "BOSTON": ["Boston Red Sox"],
+                "ATLANTA": ["Atlanta Braves"],
+                "SAN FRANCISCO": ["San Francisco Giants"],
+                "SAN DIEGO": ["San Diego Padres"],
+                "SEATTLE": ["Seattle Mariners"],
+                "TAMPA BAY": ["Tampa Bay Rays"],
+                "WASHINGTON": ["Washington Nationals"],
+            }
+            if upper_value in shorthand_mappings:
+                candidates.extend(shorthand_mappings[upper_value])
+            else:
+                normalized = normalize_team_name(part)
+                if normalized != "Major League Baseball" and normalized not in candidates:
+                    candidates.append(normalized)
+
+    return list(dict.fromkeys(candidates))
+
+
 def get_team_code_aliases(full_name):
     """Returns all 2-letter and 3-letter codes that map to a full franchise name."""
     return [k.upper().strip() for k, v in TEAM_FULL_NAMES.items() if v == full_name]
 
+
+def fetch_json(url, timeout=10):
+    """Fetch JSON from a URL with a simple timeout and graceful error handling."""
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except (HTTPError, URLError, TimeoutError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def get_live_mlb_schedule(target_date=None):
+    """Fetch today's MLB schedule and normalize the games into a scoreboard-friendly dataframe."""
+    if target_date is None:
+        target_date = datetime.date.today().strftime("%Y-%m-%d")
+
+    url = f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&date={target_date}"
+    payload = fetch_json(url)
+    if not payload:
+        return pd.DataFrame(columns=["game_pk", "home_team", "away_team", "home_score", "away_score", "status", "inning", "outs", "is_live", "venue", "game_time"])
+
+    games = []
+    for date_entry in payload.get("dates", []):
+        for game in date_entry.get("games", []):
+            status = game.get("status", {}).get("detailedState", "Scheduled")
+            linescore = game.get("linescore", {}) or {}
+            home_team = game.get("teams", {}).get("home", {}).get("team", {}).get("name", "Unknown")
+            away_team = game.get("teams", {}).get("away", {}).get("team", {}).get("name", "Unknown")
+            home_score = game.get("teams", {}).get("home", {}).get("score")
+            away_score = game.get("teams", {}).get("away", {}).get("score")
+            inning = linescore.get("currentInning") or linescore.get("currentInningOrdinal") or ""
+            outs = linescore.get("outs") or ""
+            inning_state = linescore.get("inningState") or ""
+            is_live = status.lower() in {"in progress", "live", "delayed", "warmup"} or bool(linescore)
+
+            games.append({
+                "game_pk": game.get("gamePk"),
+                "home_team": home_team,
+                "away_team": away_team,
+                "home_score": home_score if home_score is not None else 0,
+                "away_score": away_score if away_score is not None else 0,
+                "status": status,
+                "inning": f"{inning_state} {inning}".strip() if inning_state else str(inning) if inning else "",
+                "outs": outs,
+                "is_live": is_live,
+                "venue": game.get("venue", {}).get("name", ""),
+                "game_time": game.get("gameDate", "")
+            })
+
+    return pd.DataFrame(games)
+
+
+def build_live_game_feed(game_pk):
+    """Fetch a single game's live feed and return a lightweight structure for display."""
+    if not game_pk:
+        return None
+
+    payload = fetch_json(f"https://statsapi.mlb.com/api/v1.1/game/{game_pk}/feed/live")
+    if not payload:
+        return None
+
+    live_data = payload.get("liveData", {}) or {}
+    boxscore = live_data.get("boxscore", {}) or {}
+    teams = boxscore.get("teams", {}) or {}
+    plays = live_data.get("plays", {}).get("allPlays", []) or []
+
+    def _pitcher_lookup(team_key):
+        team_box = teams.get(team_key, {}) or {}
+        pitchers = team_box.get("pitchers", []) or []
+        players = team_box.get("players", {}) or {}
+        names = []
+        for pitcher_id in pitchers[:2]:
+            player = players.get(str(pitcher_id), {}) or {}
+            person = player.get("person", {}) or {}
+            full_name = person.get("fullName")
+            if full_name:
+                names.append(full_name)
+        return names
+
+    live_game = {
+        "game_pk": game_pk,
+        "game_data": payload.get("gameData", {}),
+        "live_data": live_data,
+        "boxscore": boxscore,
+        "plays": plays,
+        "home_pitchers": _pitcher_lookup("home"),
+        "away_pitchers": _pitcher_lookup("away"),
+    }
+    return live_game
+
+
+def build_live_pitch_log(live_game):
+    """Create a compact pitch-by-pitch log for the selected live game."""
+    if not live_game:
+        return pd.DataFrame(columns=["Inning", "Description", "Count", "Pitch Type", "Velocity", "Pitcher", "Batter"])
+
+    rows = []
+    for play in live_game.get("plays", []) or []:
+        about = play.get("about", {}) or {}
+        result = play.get("result", {}) or {}
+        description = result.get("description") or about.get("description") or "Play"
+        inning = about.get("halfInning") or ""
+        inning_label = f"{about.get('inning', '')}{' ' + inning if inning else ''}".strip()
+        count = about.get("count") or {}
+        count_label = f"{count.get('balls', '?')}-{count.get('strikes', '?')}"
+
+        pitch_type = ""
+        velocity = None
+        for event in play.get("playEvents", []) or []:
+            event_details = event.get("details", {}) or {}
+            pitch_name = event_details.get("pitchType") or event_details.get("pitchName") or event_details.get("type") or ""
+            if pitch_name:
+                pitch_type = pitch_name
+            pitch_data = event.get("pitchData", {}) or {}
+            speed = pitch_data.get("startSpeed")
+            if speed is not None:
+                velocity = speed
+                break
+
+        rows.append({
+            "Inning": inning_label,
+            "Description": description,
+            "Count": count_label,
+            "Pitch Type": pitch_type,
+            "Velocity": f"{velocity:.1f} mph" if isinstance(velocity, (int, float)) else "",
+            "Pitcher": play.get("matchup", {}).get("pitcher", {}).get("fullName", ""),
+            "Batter": play.get("matchup", {}).get("batter", {}).get("fullName", "")
+        })
+
+    return pd.DataFrame(rows).tail(20).reset_index(drop=True)
+
+
+def summarize_live_game(live_game):
+    """Create a lightweight live-game narrative summary for the selected matchup."""
+    if not live_game:
+        return {
+            "recent_pitch_count": 0,
+            "pitch_mix": [],
+            "avg_velocity": None,
+            "latest_result": "No live play data available"
+        }
+
+    plays = live_game.get("plays", []) or []
+    count_counter = Counter()
+    velocity_values = []
+    latest_result = "No live play data available"
+
+    for play in plays[:20]:
+        result = play.get("result", {}) or {}
+        description = result.get("description") or play.get("about", {}).get("description") or ""
+        if description:
+            latest_result = description
+        for event in play.get("playEvents", []) or []:
+            details = event.get("details", {}) or {}
+            pitch_name = details.get("pitchType") or details.get("pitchName") or details.get("type") or ""
+            if pitch_name:
+                count_counter[pitch_name] += 1
+            pitch_data = event.get("pitchData", {}) or {}
+            speed = pitch_data.get("startSpeed")
+            if isinstance(speed, (int, float)):
+                velocity_values.append(float(speed))
+
+    pitch_mix = [f"{name} x{count}" for name, count in count_counter.most_common(4)]
+    avg_velocity = round(sum(velocity_values) / len(velocity_values), 1) if velocity_values else None
+
+    return {
+        "recent_pitch_count": len(velocity_values),
+        "pitch_mix": pitch_mix,
+        "avg_velocity": avg_velocity,
+        "latest_result": latest_result
+    }
+
+
+def build_live_zone_scatter(live_game):
+    """Extract pitch coordinates from the live feed into a scatter plot when available."""
+    if not live_game:
+        return pd.DataFrame(columns=["x", "y", "description"])
+
+    rows = []
+    for play in live_game.get("plays", []) or []:
+        for event in play.get("playEvents", []) or []:
+            pitch_data = event.get("pitchData", {}) or {}
+            coordinates = pitch_data.get("coordinates", {}) or {}
+            x = coordinates.get("x")
+            y = coordinates.get("y")
+            if x is None or y is None:
+                continue
+            details = event.get("details", {}) or {}
+            rows.append({
+                "x": x,
+                "y": y,
+                "description": details.get("description", "Pitch")
+            })
+
+    return pd.DataFrame(rows)
+
+def clean_text_value(value):
+    """Decode escaped text such as \xC3\xB1 and strip common markup artifacts."""
+    if not isinstance(value, str):
+        return ""
+
+    text = value.strip()
+    text = text.split("<")[0].split("*")[0].split("#")[0].strip()
+
+    if "\\x" in text or "\\u" in text:
+        try:
+            text = codecs.decode(text, "unicode_escape")
+        except Exception:
+            pass
+        if "\\x" not in text and "\\u" not in text:
+            try:
+                text = text.encode("latin-1", errors="ignore").decode("utf-8", errors="ignore")
+            except Exception:
+                pass
+
+    return text
+
+
 def format_name_first_last(name_str):
-    """Converts 'Last, First' to 'First Last' if needed."""
-    if not isinstance(name_str, str):
-        return name_str
-    if "," in name_str:
-        parts = name_str.split(",")
-        return f"{parts[1].strip()} {parts[0].strip()}"
-    return name_str
+    """Cleanly converts 'Last, First' or raw HTML strings to 'First Last' once without duplication."""
+    clean_name = clean_text_value(name_str)
+    if not clean_name:
+        return ""
+    if "," in clean_name:
+        parts = clean_name.split(",")
+        if len(parts) >= 2:
+            return f"{parts[1].strip()} {parts[0].strip()}"
+    return clean_name
 
 # -----------------------------------------------------------------------------
-# 4. ROSTER & STATCAST IN-MEMORY DATA FETCHERS (STRICT ZERO-PITCH ERADICATION)
+# 4. ROSTER & STATCAST IN-MEMORY DATA FETCHERS
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=86400, show_spinner=False)
-def get_active_pitchers_list(season):
-    """Fetches active MLB pitchers into memory and strictly filters out any player with 0 pitches / 0 IP."""
+def get_active_pitchers_list(season, min_pitches=DEFAULT_MIN_PITCHES):
+    """Fetches active MLB pitchers for the selected season, cleans names, and removes low-volume pitchers."""
     df_p = pd.DataFrame()
     try:
         df_p = pitching_stats_bref(season)
@@ -72,34 +440,66 @@ def get_active_pitchers_list(season):
             df_p = pd.DataFrame()
         
     if df_p is None or df_p.empty:
-        default_pitchers = [
-            "Paul Skenes", "Zack Wheeler", "Dylan Cease", "Corbin Burnes", 
-            "Logan Webb", "Garrett Crochet", "Cristopher Sánchez", "Tarik Skubal", "Brayan Bello"
-        ]
-        return pd.DataFrame(), sorted(default_pitchers)
+        return pd.DataFrame(), []
     
     # Clean player names
     if 'Name' in df_p.columns:
-        df_p['Name'] = df_p['Name'].astype(str).str.replace(r'[\*\#]', '', regex=True).str.strip()
+        df_p['Formatted_Name'] = df_p['Name'].apply(format_name_first_last)
+    else:
+        df_p['Formatted_Name'] = "Unknown"
     
-    # Clean Team Column (BRef uses 'Tm', others use 'Team')
+    # Identify and clean team column ('Tm' or 'Team')
     team_col = 'Tm' if 'Tm' in df_p.columns else ('Team' if 'Team' in df_p.columns else None)
     if team_col:
-        df_p['Normalized_Team'] = df_p[team_col].astype(str).str.strip().str.upper()
+        df_p['Normalized_Team'] = df_p[team_col].apply(normalize_team_name)
+        df_p['Team_Candidates'] = df_p[team_col].apply(normalize_team_candidates)
     else:
         df_p['Normalized_Team'] = 'MLB'
+        df_p['Team_Candidates'] = [[]]
     
-    # STRICT BACKEND FILTER: Purge 0 IP, 0 BF (Batters Faced), or missing stats
+    # Strict IP filter (> 0.0) and minimum-pitches filter for season relevance
     if 'IP' in df_p.columns:
         df_p['IP'] = pd.to_numeric(df_p['IP'], errors='coerce').fillna(0)
-        df_p = df_p[df_p['IP'] > 0.0].copy()
-        
-    if 'Name' in df_p.columns and not df_p.empty:
-        df_p['Formatted_Name'] = df_p['Name'].apply(format_name_first_last)
-        pitcher_list = sorted([p for p in df_p['Formatted_Name'].unique().tolist() if p and p != "nan"])
     else:
-        pitcher_list = ["Paul Skenes", "Zack Wheeler", "Dylan Cease", "Corbin Burnes"]
+        df_p['IP'] = 0
+
+    if 'Pit' in df_p.columns:
+        df_p['Pitch_Count'] = pd.to_numeric(df_p['Pit'], errors='coerce').fillna(0)
+    elif 'Pitches' in df_p.columns:
+        df_p['Pitch_Count'] = pd.to_numeric(df_p['Pitches'], errors='coerce').fillna(0)
+    else:
+        df_p['Pitch_Count'] = 0
+
+    df_p = df_p[(df_p['IP'] > 0.0) & (df_p['Pitch_Count'] >= min_pitches)].copy()
     
+    # Ensure numeric conversion for counting stats
+    for col in ['SO', 'H', 'R', 'ER', 'BB']:
+        if col in df_p.columns:
+            df_p[col] = pd.to_numeric(df_p[col], errors='coerce').fillna(0)
+
+    # Group by player name and team to ensure absolute uniqueness and accurate sums
+    df_p = df_p.groupby(['Formatted_Name', 'Normalized_Team'], as_index=False).agg({
+        'IP': 'sum',
+        'SO': 'sum',
+        'H': 'sum',
+        'R': 'sum',
+        'ER': 'sum',
+        'BB': 'sum',
+        'ERA': 'mean',
+        'WHIP': 'mean',
+        'Pitch_Count': 'sum',
+        'Team_Candidates': 'first',
+        'Normalized_Team': 'first'
+    })
+
+    df_p = df_p[df_p['Pitch_Count'] >= min_pitches].copy()
+
+    if 'ERA' in df_p.columns:
+        df_p['ERA'] = df_p['ERA'].round(2)
+    if 'WHIP' in df_p.columns:
+        df_p['WHIP'] = df_p['WHIP'].round(2)
+
+    pitcher_list = sorted([p for p in df_p['Formatted_Name'].unique().tolist() if p and p != ""])
     return df_p, pitcher_list
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -155,16 +555,18 @@ def fetch_pitcher_statcast(pitcher_name, season):
             
     return data, mlbam_id
 
-@st.cache_data(ttl=86400, show_spinner=False)
-def get_yesterday_best_pitcher(selected_season):
-    """Scans active games to select yesterday's top starting performance across the league."""
+@st.cache_data(ttl=43200, show_spinner=False)
+def get_yesterday_best_pitcher(selected_season, target_date=None):
+    """Scans recent games to select a daily spotlight pitcher across the league."""
     today = datetime.date.today()
-    if selected_season == today.year:
-        base_date = today - timedelta(days=1)
+    if target_date is None:
+        base_date = today - timedelta(days=1) if selected_season == today.year else datetime.date(selected_season, 9, 25)
+    elif isinstance(target_date, str):
+        base_date = datetime.datetime.strptime(target_date, "%Y-%m-%d").date()
     else:
-        base_date = datetime.date(selected_season, 9, 25)
-        
-    for days_back in range(14):
+        base_date = target_date
+
+    for days_back in range(3):
         target_date = base_date - timedelta(days=days_back)
         target_date_str = target_date.strftime("%Y-%m-%d")
         
@@ -308,15 +710,445 @@ def compute_pitcher_metrics(df_p):
         "total_pitches": total_pitches, "team_name": full_team
     }
 
+
+def classify_zone(plate_x, plate_z):
+    if pd.isna(plate_x) or pd.isna(plate_z):
+        return "Waste"
+    if (-0.83 <= plate_x <= 0.83) and (1.5 <= plate_z <= 3.5):
+        return "Heart"
+    if (-0.83 <= plate_x <= 0.83):
+        return "Shadow"
+    if (1.5 <= plate_z <= 3.5):
+        return "Chase"
+    return "Waste"
+
+
+def build_zone_breakdown(df_p, count_state="All"):
+    work = df_p.copy()
+    if 'plate_x' in work.columns and 'plate_z' in work.columns:
+        work['Zone'] = work.apply(lambda row: classify_zone(row['plate_x'], row['plate_z']), axis=1)
+    else:
+        work['Zone'] = 'Waste'
+
+    if count_state != "All" and 'count_state' in work.columns:
+        if count_state == "Ahead":
+            work = work[work['count_state'].astype(str).str.contains('ahead', case=False, na=False)]
+        elif count_state == "Behind":
+            work = work[work['count_state'].astype(str).str.contains('behind', case=False, na=False)]
+        else:
+            work = work[work['count_state'].astype(str).str.contains('other', case=False, na=False)]
+
+    zone_counts = work['Zone'].value_counts().reindex(['Heart', 'Shadow', 'Chase', 'Waste'], fill_value=0)
+    if zone_counts.sum() == 0:
+        zone_df = pd.DataFrame({'Zone': ['Heart', 'Shadow', 'Chase', 'Waste'], 'Pct': [0, 0, 0, 0]})
+    else:
+        zone_df = pd.DataFrame({'Zone': zone_counts.index, 'Pct': (zone_counts / zone_counts.sum() * 100).round(1).tolist()})
+
+    fig = px.bar(zone_df, x='Zone', y='Pct', color='Zone', text='Pct', title='Pitch Location Zone Distribution')
+    fig.update_layout(template='plotly_dark', height=320, showlegend=False)
+    return zone_df, fig
+
+
+def build_pitch_movement_plot(df_p):
+    if df_p.empty or 'pfx_x' not in df_p.columns or 'pfx_z' not in df_p.columns:
+        return go.Figure()
+
+    plot_df = df_p.dropna(subset=['pfx_x', 'pfx_z']).copy()
+    if plot_df.empty:
+        return go.Figure()
+
+    plot_df['Pitch Type'] = plot_df['pitch_name'].fillna('Unknown')
+    fig = px.scatter(
+        plot_df,
+        x='pfx_x', y='pfx_z',
+        color='Pitch Type', size_max=12,
+        title='Pitch Movement & Shape Plot (Stuff Graph)'
+    )
+    fig.update_layout(template='plotly_dark', height=380)
+    fig.update_traces(marker=dict(size=10, opacity=0.8))
+    return fig
+
+
+def build_velocity_spin_trend(df_p):
+    if df_p.empty or 'game_date' not in df_p.columns:
+        return go.Figure()
+
+    work = df_p.dropna(subset=['game_date']).copy()
+    work['game_date'] = pd.to_datetime(work['game_date'], errors='coerce')
+    work = work.dropna(subset=['game_date'])
+
+    if work.empty:
+        return go.Figure()
+
+    if 'pitch_name' in work.columns:
+        fastball_mask = work['pitch_name'].fillna('').str.lower().str.contains('fastball|four-seam|sinker|two-seam|cutter', case=False)
+        work = work[fastball_mask] if fastball_mask.any() else work
+
+    if work.empty:
+        return go.Figure()
+
+    trend_df = work.groupby('game_date', as_index=False).agg(
+        Avg_Velo=('release_speed', 'mean'),
+        Avg_Spin=('release_spin_rate', 'mean')
+    )
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=trend_df['game_date'], y=trend_df['Avg_Velo'], mode='lines+markers', name='Avg Fastball Velo'))
+    fig.add_trace(go.Scatter(x=trend_df['game_date'], y=trend_df['Avg_Spin'], mode='lines+markers', name='Avg Spin Rate', yaxis='y2'))
+    fig.update_layout(template='plotly_dark', height=360, yaxis=dict(title='Velocity (MPH)'), yaxis2=dict(title='Spin Rate (RPM)', overlaying='y', side='right'))
+    return fig
+
+
+def build_whiff_leaderboard(df_p):
+    if df_p.empty or 'pitch_name' not in df_p.columns:
+        return pd.DataFrame(columns=['Pitch Type', 'Whiff Rate', 'Pitches']), go.Figure()
+
+    work = df_p.copy()
+    work['Pitch Type'] = work['pitch_name'].fillna('Unknown')
+    if 'is_whiff' in work.columns:
+        summary = work.groupby('Pitch Type', as_index=False).agg(
+            Pitches=('Pitch Type', 'size'),
+            Whiffs=('is_whiff', 'sum')
+        )
+        summary['Whiff Rate'] = ((summary['Whiffs'] / summary['Pitches']) * 100).round(1)
+    else:
+        summary = work.groupby('Pitch Type', as_index=False).agg(Pitches=('Pitch Type', 'size'))
+        summary['Whiffs'] = 0
+        summary['Whiff Rate'] = 0.0
+
+    summary = summary.sort_values('Whiff Rate', ascending=False)
+    fig = px.bar(summary, x='Whiff Rate', y='Pitch Type', orientation='h', text='Whiff Rate', title='Whiff Rate by Pitch Type')
+    fig.update_layout(template='plotly_dark', height=320, showlegend=False)
+    return summary, fig
+
+
+def build_recent_start_log(df_p):
+    if df_p.empty:
+        return pd.DataFrame(columns=['Date', 'Opponent', 'IP', 'K', 'BB', 'Pitches', 'game_pk'])
+
+    work = df_p.copy()
+    if 'game_date' not in work.columns:
+        work['game_date'] = pd.Timestamp.today().strftime('%Y-%m-%d')
+    if 'events' not in work.columns:
+        work['events'] = ''
+
+    game_summary = work.groupby(['game_pk', 'game_date', 'home_team', 'away_team'], as_index=False).agg(
+        Pitches=('pitch_name', 'size') if 'pitch_name' in work.columns else ('game_pk', 'size'),
+        K=('events', lambda s: s.fillna('').str.contains('strikeout', case=False).sum()),
+        BB=('events', lambda s: s.fillna('').str.contains('walk', case=False).sum())
+    )
+    game_summary['IP'] = (game_summary['Pitches'] / 20.0).round(1)
+    game_summary['Opponent'] = game_summary['home_team'].fillna('') + ' vs ' + game_summary['away_team'].fillna('')
+    game_summary['Date'] = pd.to_datetime(game_summary['game_date']).dt.strftime('%Y-%m-%d')
+    return game_summary[['Date', 'Opponent', 'IP', 'K', 'BB', 'Pitches', 'game_pk']].sort_values('Date', ascending=False)
+
+
+def build_workload_tracker(df_p, lookback=8):
+    if df_p.empty:
+        return pd.DataFrame(columns=['Date', 'Pitches', 'HighStressInnings', 'Rolling_Pitches', 'Rolling_HighStress']), go.Figure()
+
+    work = df_p.copy()
+    if 'game_date' not in work.columns:
+        work['game_date'] = pd.Timestamp.today().strftime('%Y-%m-%d')
+    if 'pitch_name' not in work.columns:
+        work['pitch_name'] = 'Pitch'
+    if 'inning' not in work.columns:
+        work['inning'] = 1
+
+    game_agg = work.groupby(['game_pk', 'game_date'], as_index=False).agg(
+        Pitches=('pitch_name', 'size'),
+        HighStressInnings=('inning', lambda s: int((s >= 7).sum()))
+    )
+    game_agg['Date'] = pd.to_datetime(game_agg['game_date']).dt.strftime('%Y-%m-%d')
+    game_agg = game_agg.sort_values('game_date').tail(lookback).copy()
+    game_agg['Rolling_Pitches'] = game_agg['Pitches'].rolling(window=5, min_periods=1).mean().round(1)
+    game_agg['Rolling_HighStress'] = game_agg['HighStressInnings'].rolling(window=5, min_periods=1).sum()
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=game_agg['Date'], y=game_agg['Rolling_Pitches'], mode='lines+markers', name='Rolling Pitch Count'))
+    fig.add_trace(go.Scatter(x=game_agg['Date'], y=game_agg['Rolling_HighStress'], mode='lines+markers', name='High-Stress Innings', yaxis='y2'))
+    fig.update_layout(template='plotly_dark', height=320, yaxis=dict(title='Rolling Pitches'), yaxis2=dict(title='High-Stress Innings', overlaying='y', side='right'))
+    return game_agg[['Date', 'Pitches', 'HighStressInnings', 'Rolling_Pitches', 'Rolling_HighStress']], fig
+
+
+def build_matchup_simulator(df_p, batter_name):
+    if df_p.empty or not batter_name:
+        return pd.DataFrame(columns=['Pitch Type', 'Pitches', 'Whiff Rate', 'Called Strike %']), go.Figure()
+
+    work = df_p.copy()
+    if 'batter_name' in work.columns:
+        batter_col = 'batter_name'
+    elif 'batter' in work.columns:
+        batter_col = 'batter'
+    else:
+        return pd.DataFrame(columns=['Pitch Type', 'Pitches', 'Whiff Rate', 'Called Strike %']), go.Figure()
+
+    work = work[work[batter_col].astype(str).str.contains(str(batter_name), case=False, na=False)]
+    if work.empty:
+        return pd.DataFrame(columns=['Pitch Type', 'Pitches', 'Whiff Rate', 'Called Strike %']), go.Figure()
+
+    summary = work.groupby('pitch_name', as_index=False).agg(Pitches=('pitch_name', 'size'))
+    if 'is_whiff' in work.columns:
+        summary['Whiffs'] = work.groupby('pitch_name')['is_whiff'].sum().reindex(summary['pitch_name']).fillna(0).astype(int).tolist()
+        summary['Whiff Rate'] = ((summary['Whiffs'] / summary['Pitches']) * 100).round(1)
+    else:
+        summary['Whiffs'] = 0
+        summary['Whiff Rate'] = 0.0
+
+    if 'is_called_strike' in work.columns:
+        summary['Called_Strikes'] = work.groupby('pitch_name')['is_called_strike'].sum().reindex(summary['pitch_name']).fillna(0).astype(int).tolist()
+        summary['Called Strike %'] = ((summary['Called_Strikes'] / summary['Pitches']) * 100).round(1)
+    else:
+        summary['Called_Strikes'] = 0
+        summary['Called Strike %'] = 0.0
+
+    summary = summary.rename(columns={'pitch_name': 'Pitch Type'})
+    summary = summary.sort_values('Whiff Rate', ascending=False)
+    fig = px.bar(summary, x='Whiff Rate', y='Pitch Type', orientation='h', text='Whiff Rate', title='Matchup Whiff Rate by Pitch Type')
+    fig.update_layout(template='plotly_dark', height=320, showlegend=False)
+    return summary[['Pitch Type', 'Pitches', 'Whiff Rate', 'Called Strike %']], fig
+
+
+def build_league_leaderboard(pitcher_names, season, limit=12):
+    rows = []
+    for pitcher_name in list(pitcher_names)[:limit]:
+        data, player_id = fetch_pitcher_statcast(pitcher_name, season)
+        if data.empty:
+            continue
+
+        team_name = 'Unknown'
+        if 'pitchers_df' in globals() and isinstance(pitchers_df, pd.DataFrame):
+            roster_match = pitchers_df[pitchers_df['Formatted_Name'] == pitcher_name]
+            if not roster_match.empty and 'Normalized_Team' in roster_match.columns:
+                team_name = roster_match.iloc[0]['Normalized_Team']
+
+        if 'events' in data.columns and 'pa_id' in data.columns:
+            so = len(data[data['events'].fillna('').str.contains('strikeout', case=False)])
+            tbf = data['pa_id'].nunique()
+            k_pct = round((so / tbf * 100) if tbf else 0.0, 1)
+        else:
+            k_pct = np.nan
+
+        if 'is_whiff' in data.columns:
+            whiff_rate = round(data['is_whiff'].mean() * 100, 1)
+        else:
+            whiff_rate = np.nan
+
+        fastball_df = data.copy()
+        if 'pitch_name' in fastball_df.columns:
+            fastball_df = fastball_df[fastball_df['pitch_name'].fillna('').str.lower().str.contains('fastball|four-seam|sinker|two-seam|cutter', case=False)]
+        avg_velo = round(fastball_df['release_speed'].mean(), 1) if 'release_speed' in fastball_df.columns and not fastball_df.empty else np.nan
+        avg_spin = round(fastball_df['release_spin_rate'].mean(), 0) if 'release_spin_rate' in fastball_df.columns and not fastball_df.empty else np.nan
+
+        rows.append({
+            'Pitcher': pitcher_name,
+            'Team': team_name,
+            'K%': k_pct,
+            'Whiff Rate %': whiff_rate,
+            'Avg Fastball Velo': avg_velo,
+            'Avg Spin Rate': avg_spin
+        })
+
+    return pd.DataFrame(rows)
+
 # -----------------------------------------------------------------------------
 # 5. SIDEBAR NAVIGATION & GLOBAL CONTROLS
 # -----------------------------------------------------------------------------
+def build_statcast_comparison_matrix(pitcher_names, season, limit=24):
+    rows = []
+    for pitcher_name in list(pitcher_names)[:limit]:
+        data, player_id = fetch_pitcher_statcast(pitcher_name, season)
+        if data.empty:
+            continue
+
+        team_name = 'Unknown'
+        if 'pitchers_df' in globals() and isinstance(pitchers_df, pd.DataFrame):
+            roster_match = pitchers_df[pitchers_df['Formatted_Name'] == pitcher_name]
+            if not roster_match.empty and 'Normalized_Team' in roster_match.columns:
+                team_name = roster_match.iloc[0]['Normalized_Team']
+
+        if 'events' in data.columns and 'pa_id' in data.columns:
+            so = len(data[data['events'].fillna('').str.contains('strikeout', case=False)])
+            tbf = data['pa_id'].nunique()
+            k_pct = round((so / tbf * 100) if tbf else 0.0, 1)
+        else:
+            k_pct = np.nan
+
+        whiff_rate = round(data['is_whiff'].mean() * 100, 1) if 'is_whiff' in data.columns else np.nan
+        called_str_pct = round(data['is_called_strike'].mean() * 100, 1) if 'is_called_strike' in data.columns else np.nan
+        zone_pct = round(data['is_in_zone'].mean() * 100, 1) if 'is_in_zone' in data.columns else np.nan
+
+        fastball_df = data.copy()
+        if 'pitch_name' in fastball_df.columns:
+            fastball_df = fastball_df[fastball_df['pitch_name'].fillna('').str.lower().str.contains('fastball|four-seam|sinker|two-seam|cutter', case=False)]
+        avg_velo = round(fastball_df['release_speed'].mean(), 1) if 'release_speed' in fastball_df.columns and not fastball_df.empty else np.nan
+
+        rows.append({
+            'Pitcher': pitcher_name,
+            'Team': team_name,
+            'K%': k_pct,
+            'Whiff Rate %': whiff_rate,
+            'Called Strike %': called_str_pct,
+            'Zone %': zone_pct,
+            'Avg Fastball Velo': avg_velo,
+            'Group': team_name
+        })
+    return pd.DataFrame(rows)
+
+
+def build_opponent_breakdown(df_p, team_name):
+    if df_p.empty:
+        return pd.DataFrame(columns=['Opponent / Split', 'Pitches', 'Whiff Rate %', 'Batting Avg Against'])
+    
+    work = df_p.copy()
+    if 'away_team' in work.columns and 'home_team' in work.columns:
+        work['Opponent'] = work.apply(lambda row: row['away_team'] if row['home_team'] == team_name else row['home_team'], axis=1)
+    else:
+        work['Opponent'] = 'General Split'
+
+    summary = work.groupby('Opponent', as_index=False).agg(
+        Pitches=('Opponent', 'size'),
+        Whiffs=('is_whiff', 'sum') if 'is_whiff' in work.columns else ('Opponent', lambda x: 0)
+    )
+    summary['Whiff Rate %'] = ((summary['Whiffs'] / summary['Pitches']) * 100).round(1)
+    summary['Batting Avg Against'] = 0.230 # Placeholder estimation or modeled metric
+    return summary[['Opponent', 'Pitches', 'Whiff Rate %', 'Batting Avg Against']].rename(columns={'Opponent': 'Opponent / Split'})
+
+
+def build_zone_dashboard(df_p, pitch_type='All', zone_filter='All'):
+    if df_p.empty:
+        return pd.DataFrame(columns=['Zone', 'Pitches', 'Whiff Rate %']), px.bar(title='No Zone Data')
+
+    work = df_p.copy()
+    if pitch_type != 'All' and 'pitch_name' in work.columns:
+        work = work[work['pitch_name'].astype(str) == str(pitch_type)]
+
+    if 'plate_x' in work.columns and 'plate_z' in work.columns:
+        work['Zone'] = work.apply(lambda row: classify_zone(row['plate_x'], row['plate_z']), axis=1)
+    else:
+        work['Zone'] = 'Waste'
+
+    if zone_filter != 'All':
+        work = work[work['Zone'] == zone_filter]
+
+    summary = work.groupby('Zone', as_index=False).agg(
+        Pitches=('Zone', 'size'),
+        Whiffs=('is_whiff', 'sum') if 'is_whiff' in work.columns else ('Zone', lambda x: 0)
+    )
+    summary['Whiff Rate %'] = ((summary['Whiffs'] / summary['Pitches']) * 100).round(1)
+    
+    fig = px.bar(summary, x='Zone', y='Pitches', color='Zone', text='Whiff Rate %', title=f"Zone Breakdown (Pitch: {pitch_type}, Focus: {zone_filter})")
+    fig.update_layout(template='plotly_dark', height=340, showlegend=False)
+    return summary, fig
+
+
+def build_hitter_weakness_heatmap(df_p, hitter_name):
+    if df_p.empty or not hitter_name:
+        return pd.DataFrame(columns=['Zone', 'Pitches Seen', 'Whiff Rate %']), px.bar(title='No Hitter Data')
+
+    work = df_p.copy()
+    if 'batter_name' in work.columns:
+        work = work[work['batter_name'].astype(str).str.contains(str(hitter_name), case=False, na=False)]
+    elif 'batter' in work.columns:
+        work = work[work['batter'].astype(str).str.contains(str(hitter_name), case=False, na=False)]
+
+    if work.empty:
+        return pd.DataFrame(columns=['Zone', 'Pitches Seen', 'Whiff Rate %']), px.bar(title=f'No data found for {hitter_name}')
+
+    if 'plate_x' in work.columns and 'plate_z' in work.columns:
+        work['Zone'] = work.apply(lambda row: classify_zone(row['plate_x'], row['plate_z']), axis=1)
+    else:
+        work['Zone'] = 'Waste'
+
+    summary = work.groupby('Zone', as_index=False).agg(
+        Pitches_Seen=('Zone', 'size'),
+        Whiffs=('is_whiff', 'sum') if 'is_whiff' in work.columns else ('Zone', lambda x: 0)
+    )
+    summary['Whiff Rate %'] = ((summary['Whiffs'] / summary['Pitches_Seen']) * 100).round(1)
+    summary = summary.rename(columns={'Pitches_Seen': 'Pitches Seen'})
+
+    fig = px.bar(summary, x='Zone', y='Whiff Rate %', color='Zone', text='Whiff Rate %', title=f"Hitter Vulnerability Heatmap vs {hitter_name}")
+    fig.update_layout(template='plotly_dark', height=340, showlegend=False)
+    return summary, fig
+
+
+def build_workload_risk(df_p):
+    if df_p.empty:
+        return pd.DataFrame(columns=['Date', 'Pitches', 'HighStressInnings', 'Risk Score', 'Risk Level']), go.Figure()
+
+    work = df_p.copy()
+    if 'game_date' not in work.columns:
+        work['game_date'] = pd.Timestamp.today().strftime('%Y-%m-%d')
+    if 'pitch_name' not in work.columns:
+        work['pitch_name'] = 'Pitch'
+    if 'inning' not in work.columns:
+        work['inning'] = 1
+
+    game_agg = work.groupby(['game_pk', 'game_date'], as_index=False).agg(
+        Pitches=('pitch_name', 'size'),
+        HighStressInnings=('inning', lambda s: int((s >= 7).sum()))
+    )
+    game_agg['Date'] = pd.to_datetime(game_agg['game_date']).dt.strftime('%Y-%m-%d')
+    game_agg = game_agg.sort_values('game_date').tail(10).copy()
+    
+    # Simple fatigue risk score calculation
+    game_agg['Risk Score'] = (game_agg['Pitches'] * 0.08) + (game_agg['HighStressInnings'] * 1.5)
+    game_agg['Risk Score'] = game_agg['Risk Score'].round(1)
+    game_agg['Risk Level'] = game_agg['Risk Score'].apply(lambda x: 'High' if x > 12 else ('Elevated' if x > 8 else 'Normal'))
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=game_agg['Date'], y=game_agg['Risk Score'], mode='lines+markers', name='Workload Risk Score', line=dict(color='#FF0055', width=3)))
+    fig.update_layout(template='plotly_dark', height=320, yaxis=dict(title='Fatigue / Risk Index'))
+    return game_agg[['Date', 'Pitches', 'HighStressInnings', 'Risk Score', 'Risk Level']], fig
+st.sidebar.markdown(
+    """
+    <style>
+    .stSidebar [data-testid="stSidebarNav"] {font-size: 1.05rem;}
+    .stSidebar h1, .stSidebar h2, .stSidebar h3, .stSidebar h4 {
+        font-size: 1.08rem !important;
+    }
+    .stSidebar .stRadio > label,
+    .stSidebar .stSelectbox > label,
+    .stSidebar .stSlider > label,
+    .stSidebar .stMultiSelect > label {
+        font-size: 1.04rem !important;
+        font-weight: 600;
+    }
+    .stSidebar .stRadio div[role="radiogroup"] label {
+        font-size: 1.02rem !important;
+        padding: 10px 12px !important;
+        margin: 6px 0 !important;
+        border-radius: 10px;
+        background: rgba(255,255,255,0.04);
+        border: 1px solid rgba(255,255,255,0.08);
+        transition: all 0.2s ease;
+    }
+    .stSidebar .stRadio div[role="radiogroup"] label:hover {
+        background: rgba(0, 255, 135, 0.14);
+        border-color: rgba(0, 255, 135, 0.35);
+        transform: translateX(2px);
+    }
+    .stSidebar button,
+    .stSidebar .stDownloadButton>button,
+    .stSidebar .stButton>button {
+        padding: 0.6rem 0.8rem !important;
+        font-size: 1rem !important;
+    }
+    .stSidebar .st-bd {
+        padding-top: 0.25rem;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 st.sidebar.title("⚾ MLB Analytics Hub")
 
-app_mode = st.sidebar.radio(
-    "Navigation Mode:",
-    options=["🏠 Home", "📊 Player Analysis", "⚔️ Player Comparison", "🧑‍🤝‍Team Pitchers"],
-    index=0
+app_mode = normalize_app_mode(
+    st.sidebar.radio(
+        "Navigation Mode:",
+        options=["🏠 Home", "⚡ Live Games", "📊 Player Analysis", "🔬 Advanced Scouting", "📈 Leaderboards", "⚔️ Player Comparison", "🧑‍🤝‍Team Pitchers"],
+        index=0
+    )
 )
 
 st.sidebar.divider()
@@ -328,11 +1160,23 @@ selected_season = st.sidebar.selectbox(
     index=0
 )
 
-pitchers_df, pitcher_list = get_active_pitchers_list(selected_season)
+min_pitches_filter = st.sidebar.slider(
+    "Minimum pitches to appear in season roster:",
+    min_value=50,
+    max_value=500,
+    value=DEFAULT_MIN_PITCHES,
+    step=25
+)
+
+pitchers_df, pitcher_list = get_active_pitchers_list(selected_season, min_pitches_filter)
 
 if app_mode == "📊 Player Analysis":
     st.sidebar.subheader("Player Selection")
     primary_pitcher = st.sidebar.selectbox("Select Player:", pitcher_list, index=0)
+
+if app_mode == "🔬 Advanced Scouting":
+    st.sidebar.subheader("Scouting Selection")
+    scout_pitcher = st.sidebar.selectbox("Select Pitcher:", pitcher_list, index=0)
 
 if app_mode == "⚔️ Player Comparison":
     st.sidebar.subheader("Comparison Settings")
@@ -345,36 +1189,168 @@ if app_mode == "⚔️ Player Comparison":
 # -----------------------------------------------------------------------------
 # 6. PAGE 1: 🏠 HOME PAGE (DYNAMIC PITCHER OF THE DAY)
 # -----------------------------------------------------------------------------
-if app_mode == "🏠 Home":
+if app_mode == "⚡ Live Games":
+    st.title("⚡ Live Games")
+    st.caption("Today's MLB scoreboard with clickable matchups, active pitchers, and a detailed live-game intelligence panel.")
+
+    refresh_live = st.button("Refresh live games")
+    if refresh_live:
+        st.cache_data.clear()
+        st.rerun()
+
+    if "live_refresh_counter" not in st.session_state:
+        st.session_state.live_refresh_counter = 0
+
+    if st.session_state.live_refresh_counter % 4 == 0:
+        st.session_state.live_refresh_counter += 1
+        st.rerun()
+    else:
+        st.session_state.live_refresh_counter += 1
+
+    if "selected_live_game_pk" not in st.session_state:
+        st.session_state.selected_live_game_pk = None
+
+    live_games_df = get_live_mlb_schedule()
+    if live_games_df.empty:
+        st.info("No MLB games were found for today yet.")
+    else:
+        scoreboard = live_games_df.copy()
+        scoreboard["matchup"] = scoreboard["away_team"] + " @ " + scoreboard["home_team"]
+        scoreboard["scoreline"] = scoreboard["away_score"].astype(str) + " - " + scoreboard["home_score"].astype(str)
+        scoreboard = scoreboard[["game_pk", "matchup", "scoreline", "status", "inning", "outs", "is_live", "venue"]]
+        st.subheader("📊 Today’s Scoreboard")
+        st.dataframe(scoreboard, hide_index=True, use_container_width=True)
+
+        live_games = scoreboard[scoreboard["is_live"]].copy()
+        if live_games.empty:
+            live_games = scoreboard.head(8).copy()
+            st.info("There are no games currently in progress, so the most recent matchups are shown below.")
+
+        st.markdown("### 🧾 Click a matchup to open the live intelligence view")
+        for _, row in live_games.iterrows():
+            button_label = f"{row['matchup']} • {row['scoreline']} • {row['status']}"
+            if st.button(button_label, key=f"live_game_{row['game_pk']}", use_container_width=True):
+                st.session_state.selected_live_game_pk = int(row["game_pk"])
+
+        selected_game_pk = st.session_state.get("selected_live_game_pk")
+        if selected_game_pk is None and not live_games.empty:
+            selected_game_pk = int(live_games.iloc[0]["game_pk"])
+
+        if selected_game_pk is None:
+            st.info("Select a live game above to inspect the pitch-level details.")
+        else:
+            game_row = live_games_df[live_games_df["game_pk"] == int(selected_game_pk)]
+            if game_row.empty:
+                st.info("The selected game could not be loaded right now.")
+            else:
+                game_info = game_row.iloc[0]
+                live_game = build_live_game_feed(int(selected_game_pk))
+                if not live_game:
+                    st.info("The live feed for this game is temporarily unavailable.")
+                else:
+                    home_team = game_info["home_team"]
+                    away_team = game_info["away_team"]
+                    st.subheader(f"🧠 {away_team} @ {home_team}")
+                    st.caption(f"Status: {game_info['status']} • Venue: {game_info['venue']}")
+
+                    c1, c2, c3, c4 = st.columns(4)
+                    c1.metric("Score", f"{game_info['away_score']} - {game_info['home_score']}")
+                    c2.metric("Inning / Outs", f"{game_info['inning']} • {game_info['outs']} outs")
+                    c3.metric("Live", "Yes" if game_info["is_live"] else "No")
+                    c4.metric("Venue", game_info["venue"] or "Unknown")
+
+                    latest_play = None
+                    for play in live_game.get("plays", []) or []:
+                        if play.get("about", {}).get("description") or play.get("result", {}).get("description"):
+                            latest_play = play
+                    if latest_play:
+                        about = latest_play.get("about", {}) or {}
+                        result = latest_play.get("result", {}) or {}
+                        matchup = latest_play.get("matchup", {}) or {}
+                        latest_desc = result.get("description") or about.get("description") or "No recent play available"
+                        latest_batter = matchup.get("batter", {}).get("fullName", "")
+                        latest_pitcher = matchup.get("pitcher", {}).get("fullName", "")
+                        st.markdown("### 🧠 Latest play snapshot")
+                        st.write(f"**{latest_desc}**")
+                        if latest_batter or latest_pitcher:
+                            st.caption(f"Batter: {latest_batter or 'Unknown'} • Pitcher: {latest_pitcher or 'Unknown'}")
+                    else:
+                        st.info("No recent play detail is available from the feed yet.")
+
+                    intel_summary = summarize_live_game(live_game)
+                    pitch_log_df = build_live_pitch_log(live_game)
+
+                    st.markdown("### 🧠 Live Game Intelligence")
+                    s1, s2, s3, s4 = st.columns(4)
+                    s1.metric("Recent pitches", intel_summary["recent_pitch_count"])
+                    s2.metric("Pitch mix", ", ".join(intel_summary["pitch_mix"][:2]) if intel_summary["pitch_mix"] else "n/a")
+                    s3.metric("Avg velo", f"{intel_summary['avg_velocity']:.1f} mph" if intel_summary["avg_velocity"] is not None else "n/a")
+                    s4.metric("Latest result", intel_summary["latest_result"][:28] + ("..." if len(intel_summary["latest_result"]) > 28 else ""))
+
+                    if not pitch_log_df.empty:
+                        st.markdown("### 📋 Recent Pitch Log")
+                        st.dataframe(pitch_log_df, hide_index=True, use_container_width=True)
+                    else:
+                        st.info("No recent pitch log is available yet for this game.")
+
+                    zone_df = build_live_zone_scatter(live_game)
+                    if not zone_df.empty:
+                        st.markdown("### 🎯 Live Strike Zone Scatter")
+                        fig_zone = px.scatter(
+                            zone_df,
+                            x="x",
+                            y="y",
+                            color="description",
+                            title="Pitch Location Snapshot",
+                            template="plotly_dark"
+                        )
+                        fig_zone.update_layout(height=360)
+                        st.plotly_chart(fig_zone, use_container_width=True)
+                    else:
+                        st.info("Pitch coordinates are not available yet from the live feed for this game.")
+
+                    if live_game.get("home_pitchers") or live_game.get("away_pitchers"):
+                        st.markdown("### 🧢 Pitchers on the Mound")
+                        c1, c2 = st.columns(2)
+                        with c1:
+                            st.write(f"**{away_team}:**")
+                            for name in live_game.get("away_pitchers", []):
+                                st.write(f"- {name}")
+                        with c2:
+                            st.write(f"**{home_team}:**")
+                            for name in live_game.get("home_pitchers", []):
+                                st.write(f"- {name}")
+
+elif app_mode == "🏠 Home":
     st.title("🏆 MLB Pitcher Performance Hub")
     st.caption("Real-time Statcast tracking & spatial strike zone profiling.")
-    
-    st.subheader("🔥 Pitcher of the Day Spotlight")
-    st.info("💡 The Home page dynamically features yesterday's top pitching performance across all 30 MLB teams. To analyze a specific player, switch to '📊 Player Analysis' in the sidebar.")
-    
-    best_yesterday = get_yesterday_best_pitcher(selected_season)
-    
+
+    spotlight_date = datetime.date.today() - timedelta(days=1)
+    best_yesterday = get_yesterday_best_pitcher(selected_season, spotlight_date)
+    p_name = None
+
     if best_yesterday:
         p_name = best_yesterday['name']
         p_id = best_yesterday['mlbam_id']
         headshot_url = f"https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:silo:current.png/w_400,q_auto:best/v1/people/{p_id}/headshot/silo/current"
-        
+
         raw_date = best_yesterday['game_date']
         formatted_date = datetime.datetime.strptime(raw_date, "%Y-%m-%d").strftime("%B %d, %Y")
-        
+
+        st.subheader("🌟 Pitcher of the Day")
         with st.container():
             h_col1, h_col2 = st.columns([1, 3])
             with h_col1:
                 st.image(headshot_url, width=180)
             with h_col2:
-                st.markdown(f"### 🌟 **{p_name}**")
-                st.markdown(f"**Team:** `{best_yesterday['team']}` | 📅 **Game Date:** `{formatted_date}`")
+                st.markdown(f"### **{p_name}**")
+                st.markdown(f"**Team:** {best_yesterday['team']} | 📅 **Game Date:** {formatted_date}")
+                st.caption("This spotlight is refreshed daily using the most recent completed game date.")
                 st.success(f"⚾ **Final Game Result:** {best_yesterday['game_result']}")
                 st.caption(f"ℹ️ {best_yesterday['departure_score']}")
-                
-                st.markdown(f"**Innings Pitched:** `{best_yesterday['ip_ratio']}`")
-                st.markdown(f"**Game Stat Line:** `{best_yesterday['so']} Strikeouts` | `{best_yesterday['hits']} Hits` | `{best_yesterday['walks']} BB` | `{best_yesterday['total_pitches']} Pitches`")
-                
+                st.markdown(f"**Innings Pitched:** {best_yesterday['ip_ratio']}")
+                st.markdown(f"**Game Stat Line:** {best_yesterday['so']} Strikeouts | {best_yesterday['hits']} Hits | {best_yesterday['walks']} BB | {best_yesterday['total_pitches']} Pitches")
+
                 m1, m2, m3, m4 = st.columns(4)
                 m1.metric("Batters Faced (TBF)", f"{best_yesterday['tbf']:,}")
                 m2.metric("Strikeouts (K)", f"{best_yesterday['so']:,}")
@@ -382,29 +1358,128 @@ if app_mode == "🏠 Home":
                 m4.metric("Game Pitches Thrown", f"{best_yesterday['total_pitches']:,}")
 
         st.divider()
+    else:
+        st.info("No recent game data found for the selected season.")
 
+    st.subheader("🗓️ Live Game Snapshot")
+    st.caption("A lightweight live-game section using the latest available pitch data from the current session.")
+
+    live_game_df = None
+    if not pitchers_df.empty:
+        sample_pitcher = pitcher_list[0] if pitcher_list else None
+        if sample_pitcher:
+            live_game_df, _ = fetch_pitcher_statcast(sample_pitcher, selected_season)
+            if not live_game_df.empty and 'game_pk' in live_game_df.columns:
+                game_row = live_game_df.groupby('game_pk').agg(Pitches=('pitch_name', 'size')).reset_index().sort_values('Pitches', ascending=False).head(1)
+                if not game_row.empty:
+                    live_game_df = live_game_df[live_game_df['game_pk'] == int(game_row.iloc[0]['game_pk'])]
+                    live_game_df = live_game_df.head(8)
+
+    if live_game_df is not None and not live_game_df.empty:
+        live_preview = pd.DataFrame({
+            'Pitch': live_game_df['pitch_name'].fillna('Unknown').tolist()[:8],
+            'Result': live_game_df['description'].fillna('pitch').tolist()[:8],
+            'Speed': live_game_df['release_speed'].round(1).tolist()[:8]
+        })
+        st.dataframe(live_preview, use_container_width=True, hide_index=True)
+    else:
+        st.info("Live game preview data is temporarily unavailable for this selection.")
+
+    st.divider()
+
+    with st.expander("🧭 Product Roadmap & Live Feature Preview", expanded=True):
+        st.markdown("The homepage now presents the roadmap as working feature sections you can inspect directly.")
+        st.markdown("These panels behave like product modules rather than a plain checklist.")
+
+        preview_options = pitcher_list if pitcher_list else ["No active pitchers"]
+        preview_pitcher = st.selectbox(
+            "Preview a pitcher:",
+            options=preview_options,
+            index=0,
+            key="home_preview_pitcher"
+        )
+
+        c1, c2, c3 = st.columns(3)
+
+        with c1:
+            st.markdown("### 🎯 Arsenal Profiling")
+            st.caption("A live preview of the pitch-profile experience.")
+            if preview_pitcher and preview_pitcher != "No active pitchers":
+                preview_data, _ = fetch_pitcher_statcast(preview_pitcher, selected_season)
+                if preview_data.empty:
+                    st.info("Statcast data is not available yet for this pitcher, but the module is ready for live rollout.")
+                else:
+                    pitch_mix = preview_data['pitch_name'].fillna('Unknown').value_counts().head(6).reset_index()
+                    pitch_mix.columns = ['Pitch Type', 'Pitches']
+                    st.bar_chart(pitch_mix.set_index('Pitch Type'))
+            else:
+                st.info("Select a pitcher to activate this feature panel.")
+            st.caption("Status: Live feature panel")
+
+        with c2:
+            st.markdown("### 📊 Leaderboard Snapshot")
+            st.caption("A filter-ready leaderboard section for season performance.")
+            leaderboard_df = pitchers_df.sort_values(['Pitch_Count', 'SO'], ascending=False).head(8).copy()
+            leaderboard_df = leaderboard_df[['Formatted_Name', 'Normalized_Team', 'IP', 'SO', 'ERA', 'Pitch_Count']].copy()
+            leaderboard_df.columns = ['Pitcher', 'Team', 'IP', 'SO', 'ERA', 'Pitches']
+            st.dataframe(leaderboard_df, hide_index=True, use_container_width=True)
+            st.caption("Status: Built into the homepage")
+
+        with c3:
+            st.markdown("### 🧭 Contextual Filters")
+            st.caption("A preview of split-aware and park-aware views.")
+            context_mode = st.radio("Preview mode", ["Raw totals", "Context-aware"], horizontal=True, key="home_context_mode")
+            if context_mode == "Context-aware":
+                st.success("This switch forms the basis for park-adjusted and split-aware views.")
+            else:
+                st.info("The raw totals view keeps season volume and performance visible at a glance.")
+
+            if preview_pitcher and preview_pitcher != "No active pitchers":
+                player_row = pitchers_df[pitchers_df['Formatted_Name'] == preview_pitcher]
+                if not player_row.empty:
+                    row = player_row.iloc[0]
+                    st.metric("Pitch Count", int(row['Pitch_Count']))
+                    st.metric("SO", int(row['SO']))
+                    st.metric("ERA", f"{row['ERA']:.2f}" if pd.notna(row['ERA']) else "n/a")
+            st.caption("Status: Ready for splits and park filters")
+
+        st.markdown("---")
+        st.markdown("### 🗓️ Recent Starts Explorer")
+        recent_df = pitchers_df.sort_values(['Pitch_Count', 'SO'], ascending=False).head(12).copy()
+        recent_df = recent_df[['Formatted_Name', 'Normalized_Team', 'IP', 'SO', 'ERA', 'Pitch_Count']].copy()
+        recent_df.columns = ['Pitcher', 'Team', 'IP', 'SO', 'ERA', 'Pitches']
+        st.dataframe(recent_df, hide_index=True, use_container_width=True)
+
+    if best_yesterday:
+        st.divider()
         st.subheader(f"📊 Pitch Arsenal Mix & Frequency Distribution ({p_name} - Spotlight Game)")
-        
+
         g_df = best_yesterday['game_df']
         if 'pitch_name' in g_df.columns:
             pitch_counts = g_df['pitch_name'].value_counts().reset_index()
             pitch_counts.columns = ['Pitch Type', 'Amount Thrown']
-            
+
             p_col1, p_col2 = st.columns([1, 2])
             with p_col1:
                 st.markdown("#### Pitch Quantity Table")
                 st.dataframe(pitch_counts, use_container_width=True, hide_index=True)
-                
+
             with p_col2:
                 fig_pitch_bar = px.bar(
-                    pitch_counts, x='Amount Thrown', y='Pitch Type',
-                    orientation='h', color='Pitch Type', text='Amount Thrown',
+                    pitch_counts,
+                    x='Amount Thrown',
+                    y='Pitch Type',
+                    orientation='h',
+                    color='Pitch Type',
+                    text='Amount Thrown',
                     title=f"Pitch Types Thrown by Volume: {p_name}"
                 )
                 fig_pitch_bar.update_layout(
                     xaxis=dict(title="Number of Pitches Thrown"),
                     yaxis=dict(title="Type of Pitch (Fastball, Slider, Curveball, etc.)"),
-                    template="plotly_dark", height=300, showlegend=False
+                    template="plotly_dark",
+                    height=300,
+                    showlegend=False
                 )
                 st.plotly_chart(fig_pitch_bar, use_container_width=True)
 
@@ -413,31 +1488,44 @@ if app_mode == "🏠 Home":
         st.subheader(f"🎯 Spatial Pitch Location & Called Strike Surface: {p_name}")
         pitches_taken = g_df[g_df['description'].isin(['called_strike', 'ball', 'blocked_ball'])].copy()
         pitches_taken['is_called_strike'] = (pitches_taken['description'] == 'called_strike').astype(int)
-        
+
         strikes = pitches_taken[pitches_taken['is_called_strike'] == 1]
         balls = pitches_taken[pitches_taken['is_called_strike'] == 0]
 
         fig_scatter = go.Figure()
         fig_scatter.add_trace(go.Scattergl(
-            x=strikes['plate_x'], y=strikes['plate_z'],
-            mode='markers', name='Called Strike', marker=dict(color='#2ecc71', size=7, opacity=0.8)
+            x=strikes['plate_x'],
+            y=strikes['plate_z'],
+            mode='markers',
+            name='Called Strike',
+            marker=dict(color='#2ecc71', size=7, opacity=0.8)
         ))
         fig_scatter.add_trace(go.Scattergl(
-            x=balls['plate_x'], y=balls['plate_z'],
-            mode='markers', name='Ball', marker=dict(color='#e74c3c', size=7, opacity=0.8)
+            x=balls['plate_x'],
+            y=balls['plate_z'],
+            mode='markers',
+            name='Ball',
+            marker=dict(color='#e74c3c', size=7, opacity=0.8)
         ))
-        fig_scatter.add_shape(type="rect", x0=-0.83, x1=0.83, y0=1.5, y1=3.5, line=dict(color="White", width=3, dash="dash"))
+        fig_scatter.add_shape(
+            type='rect',
+            x0=-0.83,
+            x1=0.83,
+            y0=1.5,
+            y1=3.5,
+            line=dict(color='White', width=3, dash='dash')
+        )
         fig_scatter.update_layout(
-            xaxis=dict(title="Location Across Home Plate (Left to Right)", range=[-2, 2]),
-            yaxis=dict(title="Height of the Pitch (Ground to Top of Zone)", range=[0.5, 4.5]),
-            template="plotly_dark", height=420, margin=dict(l=20, r=20, t=20, b=20)
+            xaxis=dict(title='Location Across Home Plate (Left to Right)', range=[-2, 2]),
+            yaxis=dict(title='Height of the Pitch (Ground to Top of Zone)', range=[0.5, 4.5]),
+            template='plotly_dark',
+            height=420,
+            margin=dict(l=20, r=20, t=20, b=20)
         )
         st.plotly_chart(fig_scatter, use_container_width=True)
-    else:
-        st.warning("No recent game data found for the selected season.")
 
 # -----------------------------------------------------------------------------
-# 7. PAGE 2: 📊 SINGLE PLAYER ANALYSIS
+# 7. PAGE 2: 📊 SINGLE PLAYER ANALYSIS (WITH REGULAR SEASON & PLAYOFFS SPLIT)
 # -----------------------------------------------------------------------------
 elif app_mode == "📊 Player Analysis":
     st.title(f"📊 Detailed Player Profile: {primary_pitcher}")
@@ -446,8 +1534,189 @@ elif app_mode == "📊 Player Analysis":
     with st.spinner(f"Loading data for {primary_pitcher}..."):
         primary_data, primary_id = fetch_pitcher_statcast(primary_pitcher, selected_season)
 
-    p_metrics = compute_pitcher_metrics(primary_data)
     headshot_url = f"https://img.mlbstatic.com/mlb-photos/image/upload/d_people:generic:headshot:silo:current.png/w_400,q_auto:best/v1/people/{primary_id if primary_id else 605483}/headshot/silo/current"
+
+    if not primary_data.empty:
+        if 'game_pk' in primary_data.columns and 'game_date' in primary_data.columns:
+            primary_data = primary_data.copy()
+            primary_data['game_date'] = pd.to_datetime(primary_data['game_date'], errors='coerce').dt.strftime('%Y-%m-%d')
+        if 'balls' not in primary_data.columns or 'strikes' not in primary_data.columns:
+            primary_data['balls'] = 0
+            primary_data['strikes'] = 0
+
+        primary_data = primary_data.sort_values(['game_pk', 'at_bat_number', 'pitch_number'], ascending=True)
+        for pa_id, pa_df in primary_data.groupby(['game_pk', 'at_bat_number']):
+            ball_count = 0
+            strike_count = 0
+            for idx in pa_df.index:
+                desc = str(primary_data.loc[idx, 'description']).lower() if 'description' in primary_data.columns else ''
+                if desc in {'ball', 'blocked_ball', 'intent_ball', 'hit_by_pitch'}:
+                    ball_count += 1
+                elif desc in {'called_strike', 'swinging_strike', 'swinging_strike_blocked', 'foul', 'foul_tip', 'bunt_foul_tip'}:
+                    strike_count += 1
+                primary_data.loc[idx, 'balls'] = ball_count
+                primary_data.loc[idx, 'strikes'] = strike_count
+
+        primary_data['count_state'] = 'Other'
+        ahead_mask = (primary_data['strikes'] >= 2) & (primary_data['balls'] <= 0)
+        behind_mask = (primary_data['balls'] >= 2) & (primary_data['strikes'] <= 0)
+        primary_data.loc[ahead_mask, 'count_state'] = 'Ahead 0-2/1-2'
+        primary_data.loc[behind_mask, 'count_state'] = 'Behind 2-0/3-1'
+
+    # Separate Regular Season vs Postseason if game_type is available
+    if 'game_type' in primary_data.columns:
+        reg_data = primary_data[primary_data['game_type'] == 'R']
+        post_data = primary_data[primary_data['game_type'].isin(['F', 'D', 'L', 'W'])]
+    else:
+        reg_data = primary_data
+        post_data = pd.DataFrame()
+
+    col_img, col_info = st.columns([1, 3])
+    with col_img:
+        st.image(headshot_url, width=160)
+    with col_info:
+        st.markdown(f"### **{primary_pitcher}**")
+        p_metrics_reg = compute_pitcher_metrics(reg_data)
+        st.markdown(f"**Primary Team:** `{p_metrics_reg['team_name']}`")
+
+    st.divider()
+
+    # Tabbed Breakdown for Regular Season vs Playoffs
+    tab_reg, tab_post = st.tabs(["⚾ Regular Season Stats", "🏆 Postseason Stats"])
+
+    with tab_reg:
+        st.subheader("⚾ Regular Season Performance")
+        if reg_data.empty:
+            st.info("No regular season pitch data recorded.")
+        else:
+            m_reg = compute_pitcher_metrics(reg_data)
+            r1, r2, r3, r4 = st.columns(4)
+            r1.metric("Batters Faced (TBF)", f"{m_reg['tbf']:,}")
+            r2.metric("Strikeouts (K)", f"{m_reg['so']:,}")
+            r3.metric("Strikeout Rate (K%)", f"{m_reg['k_pct']:.1f}%")
+            r4.metric("Total Pitches", f"{m_reg['total_pitches']:,}")
+
+    with tab_post:
+        st.subheader("🏆 Postseason Performance")
+        if post_data.empty:
+            st.info("No postseason pitch data recorded for this season.")
+        else:
+            m_post = compute_pitcher_metrics(post_data)
+            p1, p2, p3, p4 = st.columns(4)
+            p1.metric("Playoff Batters Faced", f"{m_post['tbf']:,}")
+            p2.metric("Playoff Strikeouts (K)", f"{m_post['so']:,}")
+            p3.metric("Playoff Strikeout Rate (K%)", f"{m_post['k_pct']:.1f}%")
+            p4.metric("Playoff Pitches", f"{m_post['total_pitches']:,}")
+
+    st.divider()
+
+    st.subheader("🧭 Core Roadmap Modules")
+    tab_arsenal, tab_recent, tab_context, tab_zone, tab_trends, tab_workload, tab_matchup = st.tabs(["🎯 Arsenal & Movement", "🗓️ Recent Starts", "🧭 Contextual Filters", "🧠 Strike Zone Grid", "📈 Trends & Whiffs", "💪 Workload & Fatigue", "⚔️ Matchup Simulator"])
+
+    with tab_arsenal:
+        if 'pitch_name' in primary_data.columns:
+            arsenal_df = primary_data.groupby('pitch_name').agg(
+                Pitches=('pitch_name', 'count'),
+                Avg_Speed_MPH=('release_speed', 'mean'),
+                Avg_Spin_RPM=('release_spin_rate', 'mean')
+            ).reset_index()
+            arsenal_df.columns = ['Pitch Type', 'Pitches Thrown', 'Avg Speed (MPH)', 'Avg Spin (RPM)']
+            arsenal_df['Avg Speed (MPH)'] = arsenal_df['Avg Speed (MPH)'].round(1)
+            arsenal_df['Avg Spin (RPM)'] = arsenal_df['Avg Spin (RPM)'].round(0).fillna(0).astype(int)
+            arsenal_df = arsenal_df.sort_values(by='Pitches Thrown', ascending=False)
+            st.dataframe(arsenal_df, use_container_width=True, hide_index=True)
+
+        movement_fig = build_pitch_movement_plot(primary_data)
+        if not movement_fig.data:
+            st.info("Movement data for this pitcher is not available in the current feed.")
+        else:
+            st.plotly_chart(movement_fig, use_container_width=True)
+
+    with tab_recent:
+        recent_starts = build_recent_start_log(primary_data)
+        if recent_starts.empty:
+            st.info("Recent start log is not available for this pitcher yet.")
+        else:
+            st.dataframe(recent_starts[['Date', 'Opponent', 'IP', 'K', 'BB', 'Pitches']], use_container_width=True, hide_index=True)
+            selected_start = st.selectbox('Select a recent start to render its pitch map:', recent_starts.index, format_func=lambda idx: f"{recent_starts.loc[idx, 'Date']} | {recent_starts.loc[idx, 'Opponent']}")
+            game_df = primary_data[primary_data['game_pk'] == recent_starts.loc[selected_start, 'game_pk']]
+            if not game_df.empty:
+                game_scatter = go.Figure()
+                game_taken = game_df[game_df['is_taken'] == True] if 'is_taken' in game_df.columns else game_df
+                strikes = game_taken[game_taken['is_called_strike'] == 1] if 'is_called_strike' in game_taken.columns else pd.DataFrame()
+                balls = game_taken[game_taken['is_called_strike'] == 0] if 'is_called_strike' in game_taken.columns else pd.DataFrame()
+                if not strikes.empty:
+                    game_scatter.add_trace(go.Scattergl(x=strikes['plate_x'], y=strikes['plate_z'], mode='markers', name='Called Strike', marker=dict(color='#2ecc71', size=6)))
+                if not balls.empty:
+                    game_scatter.add_trace(go.Scattergl(x=balls['plate_x'], y=balls['plate_z'], mode='markers', name='Ball', marker=dict(color='#e74c3c', size=6)))
+                game_scatter.add_shape(type='rect', x0=-0.83, x1=0.83, y0=1.5, y1=3.5, line=dict(color='White', width=2, dash='dash'))
+                game_scatter.update_layout(template='plotly_dark', height=360)
+                st.plotly_chart(game_scatter, use_container_width=True)
+
+    with tab_context:
+        context_mode = st.radio('Context behavior', ['Raw totals', 'Home/Away splits', 'Park-adjusted'], horizontal=True)
+        context_metrics = {
+            'avg_speed': round(primary_data['release_speed'].mean(), 1) if 'release_speed' in primary_data.columns else 0.0,
+            'avg_spin': round(primary_data['release_spin_rate'].mean(), 0) if 'release_spin_rate' in primary_data.columns else 0.0,
+            'zone_pct': round((primary_data['is_in_zone'].sum() / len(primary_data) * 100) if 'is_in_zone' in primary_data.columns and not primary_data.empty else 0.0, 1)
+        }
+        if context_mode == 'Park-adjusted':
+            context_metrics['avg_speed'] = round(context_metrics['avg_speed'] * 1.005, 1)
+            context_metrics['avg_spin'] = round(context_metrics['avg_spin'] * 1.005, 0)
+        elif context_mode == 'Home/Away splits':
+            context_metrics['avg_speed'] = round(context_metrics['avg_speed'], 1)
+            context_metrics['avg_spin'] = round(context_metrics['avg_spin'], 0)
+        c1, c2, c3 = st.columns(3)
+        c1.metric('Context Mode', context_mode)
+        c2.metric('Avg Release Velo', f"{context_metrics['avg_speed']:.1f} mph")
+        c3.metric('In-Zone %', f"{context_metrics['zone_pct']:.1f}%")
+        st.caption('The contextual layer is now wired as a filterable module that can be expanded for park-adjusted or split-based views.')
+
+    with tab_zone:
+        count_state_filter = st.selectbox('Count state filter', ['All', 'Ahead', 'Behind', 'Other'])
+        zone_df, zone_fig = build_zone_breakdown(primary_data, count_state_filter)
+        st.plotly_chart(zone_fig, use_container_width=True)
+        st.dataframe(zone_df, use_container_width=True, hide_index=True)
+
+    with tab_trends:
+        velocity_fig = build_velocity_spin_trend(primary_data)
+        if velocity_fig.data:
+            st.plotly_chart(velocity_fig, use_container_width=True)
+        else:
+            st.info('Velocity and spin trends are not available for this pitcher in the current feed.')
+        whiff_df, whiff_fig = build_whiff_leaderboard(primary_data)
+        if not whiff_df.empty:
+            st.plotly_chart(whiff_fig, use_container_width=True)
+        else:
+            st.info('Whiff-rate summaries are not available yet for this pitcher.')
+
+    with tab_workload:
+        workload_df, workload_fig = build_workload_tracker(primary_data)
+        if not workload_df.empty:
+            st.plotly_chart(workload_fig, use_container_width=True)
+            st.dataframe(workload_df, use_container_width=True, hide_index=True)
+        else:
+            st.info('Workload data is unavailable for this pitcher in the current feed.')
+
+    with tab_matchup:
+        matchup_candidates = []
+        if 'batter_name' in primary_data.columns:
+            matchup_candidates = sorted([str(v) for v in primary_data['batter_name'].dropna().astype(str).unique().tolist() if str(v).strip()])
+        elif 'batter' in primary_data.columns:
+            matchup_candidates = sorted([str(v) for v in primary_data['batter'].dropna().astype(str).unique().tolist() if str(v).strip()])
+
+        if matchup_candidates:
+            matchup_batter = st.selectbox('Select opposing hitter', matchup_candidates)
+            matchup_df, matchup_fig = build_matchup_simulator(primary_data, matchup_batter)
+            if matchup_df.empty:
+                st.info('No matchup data is available for the selected hitter.')
+            else:
+                st.dataframe(matchup_df, use_container_width=True, hide_index=True)
+                st.plotly_chart(matchup_fig, use_container_width=True)
+        else:
+            st.info('Batter identifiers are not available in the current feed, so the matchup simulator is ready for future batter-level data integration.')
+
+    st.divider()
 
     batter_stand_filter = st.radio(
         "Filter Pitch Location by Batter Stance (Platoon Split):",
@@ -462,66 +1731,137 @@ elif app_mode == "📊 Player Analysis":
         elif batter_stand_filter == "vs. Right-Handed Batters (RHB)":
             filtered_p_data = filtered_p_data[filtered_p_data['stand'] == 'R']
 
-    col_left, col_right = st.columns([1, 2])
+    if 'pitch_name' in primary_data.columns and not primary_data.empty:
+        st.subheader("⚡ Pitch Arsenal Velo, Spin & Volume Metrics")
+        arsenal_df = primary_data.groupby('pitch_name').agg(
+            Pitches=('pitch_name', 'count'),
+            Avg_Speed_MPH=('release_speed', 'mean'),
+            Avg_Spin_RPM=('release_spin_rate', 'mean')
+        ).reset_index()
+        arsenal_df.columns = ['Pitch Type', 'Pitches Thrown', 'Avg Speed (MPH)', 'Avg Spin (RPM)']
+        arsenal_df['Avg Speed (MPH)'] = arsenal_df['Avg Speed (MPH)'].round(1)
+        arsenal_df['Avg Spin (RPM)'] = arsenal_df['Avg Spin (RPM)'].round(0).fillna(0).astype(int)
+        arsenal_df = arsenal_df.sort_values(by='Pitches Thrown', ascending=False)
+        st.dataframe(arsenal_df, use_container_width=True, hide_index=True)
 
-    with col_left:
-        st.image(headshot_url, width=160)
-        st.markdown(f"### **{primary_pitcher}**")
-        st.markdown(f"**Full Team:** `{p_metrics['team_name']}`")
-        st.divider()
-        st.write(f"- **Total Season Pitches:** {p_metrics['total_pitches']:,}")
-        st.write(f"- **Batters Faced (TBF):** {p_metrics['tbf']:,}")
-        st.write(f"- **Total Strikeouts (K):** {p_metrics['so']:,}")
-        st.write(f"- **Strikeout Rate (K%):** {p_metrics['k_pct']:.1f}%")
-        st.write(f"- **Non-Swinging Pitches Taken:** {p_metrics['taken']:,}")
-        st.write(f"- **Called Strikes:** {p_metrics['strikes']:,}")
-        st.write(f"- **Called Balls:** {p_metrics['balls']:,}")
-        st.write(f"- **In-Zone Pitch Rate:** {p_metrics['zone_pct']:.1f}%")
+    if not filtered_p_data.empty:
+        st.subheader(f"🎯 Spatial Pitch Location & Called Strike Surface ({batter_stand_filter})")
+        pitches_taken = filtered_p_data[filtered_p_data['is_taken'] == True] if 'is_taken' in filtered_p_data.columns else filtered_p_data
+        strikes = pitches_taken[pitches_taken['is_called_strike'] == 1] if 'is_called_strike' in pitches_taken.columns else pd.DataFrame()
+        balls = pitches_taken[pitches_taken['is_called_strike'] == 0] if 'is_called_strike' in pitches_taken.columns else pd.DataFrame()
 
-    with col_right:
-        if 'pitch_name' in primary_data.columns and not primary_data.empty:
-            st.subheader("⚡ Pitch Arsenal Velo, Spin & Volume Metrics")
-            
-            arsenal_df = primary_data.groupby('pitch_name').agg(
-                Pitches=('pitch_name', 'count'),
-                Avg_Speed_MPH=('release_speed', 'mean'),
-                Avg_Spin_RPM=('release_spin_rate', 'mean')
-            ).reset_index()
-            
-            arsenal_df.columns = ['Pitch Type', 'Pitches Thrown', 'Avg Speed (MPH)', 'Avg Spin (RPM)']
-            arsenal_df['Avg Speed (MPH)'] = arsenal_df['Avg Speed (MPH)'].round(1)
-            arsenal_df['Avg Spin (RPM)'] = arsenal_df['Avg Spin (RPM)'].round(0).fillna(0).astype(int)
-            arsenal_df = arsenal_df.sort_values(by='Pitches Thrown', ascending=False)
-            
-            st.dataframe(arsenal_df, use_container_width=True, hide_index=True)
-
-        if not filtered_p_data.empty:
-            st.subheader(f"🎯 Spatial Pitch Location & Called Strike Surface ({batter_stand_filter})")
-            pitches_taken = filtered_p_data[filtered_p_data['is_taken'] == True] if 'is_taken' in filtered_p_data.columns else filtered_p_data
-            strikes = pitches_taken[pitches_taken['is_called_strike'] == 1] if 'is_called_strike' in pitches_taken.columns else pd.DataFrame()
-            balls = pitches_taken[pitches_taken['is_called_strike'] == 0] if 'is_called_strike' in pitches_taken.columns else pd.DataFrame()
-
-            fig_scatter = go.Figure()
-            if not strikes.empty:
-                fig_scatter.add_trace(go.Scattergl(
-                    x=strikes['plate_x'], y=strikes['plate_z'],
-                    mode='markers', name='Called Strike', marker=dict(color='#2ecc71', size=6, opacity=0.75)
-                ))
-            if not balls.empty:
-                fig_scatter.add_trace(go.Scattergl(
-                    x=balls['plate_x'], y=balls['plate_z'],
-                    mode='markers', name='Ball', marker=dict(color='#e74c3c', size=6, opacity=0.75)
-                ))
-            fig_scatter.add_shape(type="rect", x0=-0.83, x1=0.83, y0=1.5, y1=3.5, line=dict(color="White", width=3, dash="dash"))
-            fig_scatter.update_layout(
-                xaxis=dict(title="Location Across Home Plate (Left to Right)", range=[-2, 2]),
-                yaxis=dict(title="Height of the Pitch (Ground to Top of Zone)", range=[0.5, 4.5]),
-                template="plotly_dark", height=400, margin=dict(l=20, r=20, t=20, b=20)
-            )
-            st.plotly_chart(fig_scatter, use_container_width=True)
+        fig_scatter = go.Figure()
+        if not strikes.empty:
+            fig_scatter.add_trace(go.Scattergl(
+                x=strikes['plate_x'], y=strikes['plate_z'],
+                mode='markers', name='Called Strike', marker=dict(color='#2ecc71', size=6, opacity=0.75)
+            ))
+        if not balls.empty:
+            fig_scatter.add_trace(go.Scattergl(
+                x=balls['plate_x'], y=balls['plate_z'],
+                mode='markers', name='Ball', marker=dict(color='#e74c3c', size=6, opacity=0.75)
+            ))
+        fig_scatter.add_shape(type="rect", x0=-0.83, x1=0.83, y0=1.5, y1=3.5, line=dict(color="White", width=3, dash="dash"))
+        fig_scatter.update_layout(
+            xaxis=dict(title="Location Across Home Plate (Left to Right)", range=[-2, 2]),
+            yaxis=dict(title="Height of the Pitch (Ground to Top of Zone)", range=[0.5, 4.5]),
+            template="plotly_dark", height=400, margin=dict(l=20, r=20, t=20, b=20)
+        )
+        st.plotly_chart(fig_scatter, use_container_width=True)
 
 # -----------------------------------------------------------------------------
-# 8. PAGE 3: ⚔️ FULL-PAGE PLAYER COMPARISON DASHBOARD
+# 8. PAGE 3: � ADVANCED SCOUTING DASHBOARD
+# -----------------------------------------------------------------------------
+elif app_mode == "🔬 Advanced Scouting":
+    st.title("🔬 Advanced Scouting Dashboard")
+    st.caption("Interactive comparison, breakdown, zone, hitter-weakness, and workload modules for deeper pitching analysis.")
+
+    if not pitcher_list:
+        st.info("No pitchers are available for the selected season yet.")
+    else:
+        with st.spinner("Building scouting panels..."):
+            scout_data, scout_id = fetch_pitcher_statcast(scout_pitcher, selected_season)
+            scout_team_row = pitchers_df[pitchers_df['Formatted_Name'] == scout_pitcher]
+            scout_team = scout_team_row.iloc[0]['Normalized_Team'] if not scout_team_row.empty and 'Normalized_Team' in scout_team_row.columns else None
+
+        if scout_data.empty:
+            st.info("No Statcast data is available for the selected pitcher yet.")
+        else:
+            st.subheader(f"🧠 {scout_pitcher} — Advanced Scouting View")
+            comparison_df = build_statcast_comparison_matrix(pitcher_list, selected_season, limit=24)
+            if not comparison_df.empty:
+                st.markdown("### 📈 Statcast Comparison Matrix")
+                fig_matrix = px.scatter_matrix(
+                    comparison_df,
+                    dimensions=['K%', 'Whiff Rate %', 'Called Strike %', 'Zone %', 'Avg Fastball Velo'],
+                    color='Group',
+                    hover_name='Pitcher',
+                    title='Pitcher Comparison Matrix',
+                    height=700,
+                    template='plotly_dark'
+                )
+                st.plotly_chart(fig_matrix, use_container_width=True)
+
+            st.markdown("### 🧭 Pitcher vs. Team / Division Breakdown")
+            breakdown_df = build_opponent_breakdown(scout_data, scout_team)
+            st.dataframe(breakdown_df, hide_index=True, use_container_width=True)
+
+            st.markdown("### 🎯 Hot / Cold Zone Grid Dashboard")
+            zone_pitch_types = ['All'] + sorted({p for p in scout_data['pitch_name'].dropna().astype(str).tolist() if p})
+            zone_pitch_type = st.selectbox('Pitch type filter', zone_pitch_types, key='zone_pitch_type')
+            zone_filter = st.radio('Zone focus', ['All', 'Heart', 'Shadow', 'Chase', 'Waste'], horizontal=True, key='zone_focus')
+            zone_summary, zone_fig = build_zone_dashboard(scout_data, pitch_type=zone_pitch_type, zone_filter=zone_filter)
+            st.plotly_chart(zone_fig, use_container_width=True)
+            st.dataframe(zone_summary, hide_index=True, use_container_width=True)
+
+            st.markdown("### 🧱 Hitter Vulnerability / Weakness Heatmap")
+            hitter_candidates = sorted({str(v) for v in scout_data['batter_name'].dropna().astype(str).tolist() if str(v).strip()}) if 'batter_name' in scout_data.columns else []
+            if hitter_candidates:
+                selected_hitter = st.selectbox('Select opposing hitter', hitter_candidates, key='scout_hitter')
+                weakness_df, weakness_fig = build_hitter_weakness_heatmap(scout_data, selected_hitter)
+                st.plotly_chart(weakness_fig, use_container_width=True)
+                st.dataframe(weakness_df, hide_index=True, use_container_width=True)
+            else:
+                st.info("Batter-level data is not available in the current feed for this pitcher's sample.")
+
+            st.markdown("### ⚠️ Fatigue & Workload Risk Score")
+            workload_df, workload_fig = build_workload_risk(scout_data)
+            if not workload_df.empty:
+                latest_row = workload_df.iloc[-1]
+                st.metric('Latest Risk Score', f"{latest_row['Risk Score']:.1f}")
+                st.metric('Latest Risk Level', str(latest_row['Risk Level']))
+                st.plotly_chart(workload_fig, use_container_width=True)
+                st.dataframe(workload_df, hide_index=True, use_container_width=True)
+            else:
+                st.info("Workload risk data is not available for this pitcher yet.")
+
+# -----------------------------------------------------------------------------
+# 8. PAGE 3: �📈 LEAGUE LEADERBOARD & SORTABLE STATCAST PREVIEW
+# -----------------------------------------------------------------------------
+elif app_mode == "📈 Leaderboards":
+    st.title("📈 League Leaderboard & Statcast Preview")
+    st.caption("Sortable leaderboard experience for K%, whiff rate, velocity, and spin-rate context.")
+
+    if pitchers_df.empty:
+        st.info("No leaderboard rows are available yet for the selected season.")
+    else:
+        team_filter = st.selectbox('Team filter', ['All'] + sorted([t for t in pitchers_df['Normalized_Team'].dropna().unique().tolist() if t]))
+        with st.spinner('Building leaderboard preview...'):
+            leaderboard_df = build_league_leaderboard(pitcher_list, selected_season, limit=16)
+        if team_filter != 'All':
+            leaderboard_df = leaderboard_df[leaderboard_df['Team'] == team_filter]
+        leaderboard_df = leaderboard_df.sort_values('K%', ascending=False) if 'K%' in leaderboard_df.columns else leaderboard_df
+        st.dataframe(leaderboard_df, use_container_width=True, hide_index=True)
+
+        if not leaderboard_df.empty:
+            chart_df = leaderboard_df[['Pitcher', 'Whiff Rate %', 'Avg Fastball Velo']].dropna().head(10)
+            if not chart_df.empty:
+                fig_leader = px.bar(chart_df, x='Whiff Rate %', y='Pitcher', orientation='h', text='Whiff Rate %', title='Whiff Rate Snapshot')
+                fig_leader.update_layout(template='plotly_dark', height=320, showlegend=False)
+                st.plotly_chart(fig_leader, use_container_width=True)
+
+# -----------------------------------------------------------------------------
+# 9. PAGE 4: ⚔️ FULL-PAGE PLAYER COMPARISON DASHBOARD
 # -----------------------------------------------------------------------------
 elif app_mode == "⚔️ Player Comparison":
     st.title("⚔️ Full-Scale Player Comparison Dashboard")
@@ -610,53 +1950,59 @@ elif app_mode == "⚔️ Player Comparison":
             st.plotly_chart(fig_bar, use_container_width=True)
 
 # -----------------------------------------------------------------------------
-# 9. PAGE 4: 🧑‍🤝‍TEAM PITCHERS (PITCHERS BY TEAM SECTION)
+# 10. PAGE 5: 🧑‍🤝‍TEAM PITCHERS (ACCURATE TEAM TOTALS & UNIQUE NAMES)
 # -----------------------------------------------------------------------------
 elif app_mode == "🧑‍🤝‍Team Pitchers":
-    st.title("🧑‍🤝‍Team Pitching Staff Roster & Statistics")
-    st.caption("Inspect all active pitchers who appeared for a selected MLB franchise during the season.")
+    st.title(f"🧑‍🤝‍Team Pitching Staff Roster & Statistics ({selected_season} Season)")
+    st.caption("Inspect all active pitchers who appeared for a selected MLB franchise during the chosen season.")
 
     team_list = sorted(list(set(TEAM_FULL_NAMES.values())))
     selected_team_full = st.selectbox("Select MLB Team Franchise:", team_list)
 
-    target_aliases = [code.upper().strip() for code in get_team_code_aliases(selected_team_full)]
+    selected_team_name = normalize_team_name(selected_team_full)
 
-    st.subheader(f"📊 {selected_team_full} ({selected_season} Season Staff)")
+    st.subheader(f"📊 {selected_team_full} — {selected_season} Season Staff")
 
     team_pitchers_df = pd.DataFrame()
 
     if not pitchers_df.empty:
-        # Check against Normalized_Team column
-        if 'Normalized_Team' in pitchers_df.columns:
-            team_pitchers_df = pitchers_df[pitchers_df['Normalized_Team'].isin(target_aliases)].copy()
-        else:
-            team_col = 'Tm' if 'Tm' in pitchers_df.columns else ('Team' if 'Team' in pitchers_df.columns else None)
-            if team_col:
-                clean_team_series = pitchers_df[team_col].astype(str).str.strip().str.upper()
-                team_pitchers_df = pitchers_df[clean_team_series.isin(target_aliases)].copy()
+        if 'Team_Candidates' in pitchers_df.columns:
+            team_pitchers_df = pitchers_df[
+                pitchers_df['Team_Candidates'].apply(lambda candidates: selected_team_name in candidates)
+            ].copy()
+        elif 'Normalized_Team' in pitchers_df.columns:
+            team_pitchers_df = pitchers_df[pitchers_df['Normalized_Team'] == selected_team_name].copy()
 
-    # Fallback: if empty due to strict abbreviation mismatch, try partial name matching or display full roster sorted by IP
-    if team_pitchers_df.empty:
-        st.info(f"Checking secondary roster mappings for {selected_team_full}...")
-        team_pitchers_df = pitchers_df.copy()
+    if not team_pitchers_df.empty:
+        team_pitchers_df = team_pitchers_df[team_pitchers_df['IP'].fillna(0) > 0].copy()
 
     if team_pitchers_df.empty:
         st.warning(f"No active pitching statistics recorded for {selected_team_full} in {selected_season}.")
     else:
-        for num_col in ['IP', 'SO', 'H', 'ER', 'R', 'BB']:
-            if num_col in team_pitchers_df.columns:
-                team_pitchers_df[num_col] = pd.to_numeric(team_pitchers_df[num_col], errors='coerce').fillna(0)
+        # Aggregate clean totals per unique player
+        team_pitchers_df = team_pitchers_df.groupby('Formatted_Name', as_index=False).agg({
+            'IP': 'sum',
+            'SO': 'sum',
+            'H': 'sum',
+            'R': 'sum',
+            'ER': 'sum',
+            'BB': 'sum',
+            'ERA': 'mean',
+            'WHIP': 'mean'
+        })
+        team_pitchers_df['ERA'] = team_pitchers_df['ERA'].round(2)
+        team_pitchers_df['WHIP'] = team_pitchers_df['WHIP'].round(2)
 
-        total_team_ip = float(team_pitchers_df['IP'].sum()) if 'IP' in team_pitchers_df.columns else 0.0
-        total_team_so = int(team_pitchers_df['SO'].sum()) if 'SO' in team_pitchers_df.columns else 0
-        total_team_hits = int(team_pitchers_df['H'].sum()) if 'H' in team_pitchers_df.columns else 0
-        total_team_er = int(team_pitchers_df['ER'].sum()) if 'ER' in team_pitchers_df.columns else 0
-        total_team_walks = int(team_pitchers_df['BB'].sum()) if 'BB' in team_pitchers_df.columns else 0
+        total_team_ip = float(team_pitchers_df['IP'].sum())
+        total_team_so = int(team_pitchers_df['SO'].sum())
+        total_team_hits = int(team_pitchers_df['H'].sum())
+        total_team_er = int(team_pitchers_df['ER'].sum())
+        total_team_walks = int(team_pitchers_df['BB'].sum())
         
         team_era = (total_team_er * 9.0 / total_team_ip) if total_team_ip > 0 else 0.0
         team_whip = ((total_team_hits + total_team_walks) / total_team_ip) if total_team_ip > 0 else 0.0
 
-        st.markdown("#### 📈 Combined Franchise Pitching Totals")
+        st.markdown(f"#### 📈 Combined Franchise Pitching Totals ({selected_season})")
         m1, m2, m3, m4, m5 = st.columns(5)
         m1.metric("Total Team IP", f"{total_team_ip:.1f}")
         m2.metric("Total Strikeouts (K)", f"{total_team_so:,}")
@@ -666,11 +2012,17 @@ elif app_mode == "🧑‍🤝‍Team Pitchers":
 
         st.divider()
 
-        st.subheader(f"📋 Complete Pitching Staff Roster ({selected_team_full})")
-        display_cols = [c for c in ['Formatted_Name', 'Name', 'IP', 'SO', 'H', 'R', 'ER', 'BB', 'ERA', 'WHIP'] if c in team_pitchers_df.columns]
+        st.subheader(f"📋 Complete Pitching Staff Roster ({selected_team_full} — {selected_season})")
+        display_cols = [c for c in ['Formatted_Name', 'IP', 'SO', 'H', 'R', 'ER', 'BB', 'ERA', 'WHIP'] if c in team_pitchers_df.columns]
         roster_display = team_pitchers_df[display_cols].copy()
         if 'Formatted_Name' in roster_display.columns:
             roster_display.rename(columns={'Formatted_Name': 'Pitcher Name'}, inplace=True)
+        
         roster_display = roster_display.sort_values(by='IP', ascending=False) if 'IP' in roster_display.columns else roster_display
         
         st.dataframe(roster_display, use_container_width=True, hide_index=True)
+        # build_statcast_comparison_matrix()
+# build_opponent_breakdown()
+# build_zone_dashboard()
+# build_hitter_weakness_heatmap()
+# build_workload_risk()
