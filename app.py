@@ -50,7 +50,7 @@ def normalize_app_mode(mode):
     if not isinstance(mode, str):
         return "🏠 Home"
 
-    cleaned = mode.strip().replace("�", "")
+    cleaned = mode.strip().replace("", "")
     if not cleaned:
         return "🏠 Home"
 
@@ -1262,6 +1262,184 @@ def build_workload_risk(df_p):
     fig.add_trace(go.Scatter(x=game_agg['Date'], y=game_agg['Risk Score'], mode='lines+markers', name='Workload Risk Score', line=dict(color='#FF0055', width=3)))
     fig.update_layout(template='plotly_dark', height=320, yaxis=dict(title='Fatigue / Risk Index'))
     return game_agg[['Date', 'Pitches', 'HighStressInnings', 'Risk Score', 'Risk Level']], fig
+
+
+# -------------------------------------------------------------------------
+# 5. ADVANCED MODERN ANALYTICS MODULES (Active Spin, Tunneling, ABS, Percentiles)
+# -------------------------------------------------------------------------
+
+def compute_active_spin_and_extension(statcast_df):
+    """Compute Active Spin and Release Extension per pitch type."""
+    if statcast_df is None or statcast_df.empty:
+        return pd.DataFrame(columns=[
+            "pitch_type", "pitch_name", "avg_spin", "active_spin", "avg_extension"
+        ])
+
+    df = statcast_df.copy()
+
+    # Active Spin approximation: spin that contributes to movement
+    if "release_spin_rate" in df.columns:
+        df["active_spin"] = df["release_spin_rate"].astype(float)
+        if "is_in_zone" in df.columns:
+            df["active_spin"] *= (df["is_in_zone"].astype(int) + 0.5)
+    else:
+        df["active_spin"] = 0.0
+
+    # Release extension
+    if "release_extension" not in df.columns:
+        df["release_extension"] = np.nan
+
+    group_cols = [c for c in ["pitch_type", "pitch_name"] if c in df.columns]
+    if not group_cols:
+        group_cols = ["pitch_type"]
+
+    agg = df.groupby(group_cols, as_index=False).agg({
+        "release_spin_rate": "mean",
+        "active_spin": "mean",
+        "release_extension": "mean"
+    })
+
+    agg.rename(columns={
+        "release_spin_rate": "avg_spin",
+        "release_extension": "avg_extension"
+    }, inplace=True)
+
+    agg["avg_spin"] = agg["avg_spin"].round(0)
+    agg["active_spin"] = agg["active_spin"].round(0)
+    agg["avg_extension"] = agg["avg_extension"].round(2)
+
+    return agg
+
+
+def compute_pitch_tunneling_sequences(statcast_df, max_sequences=40):
+    """Compute pitch tunneling scores for consecutive pitches."""
+    if statcast_df is None or statcast_df.empty:
+        return pd.DataFrame(columns=[
+            "pa_id", "pitch_type_1", "pitch_type_2",
+            "start_dist", "end_dist", "tunneling_score"
+        ])
+
+    df = statcast_df.copy()
+    sort_cols = [c for c in ["game_pk", "pa_id", "inning", "pitch_number"] if c in df.columns]
+    df = df.sort_values(sort_cols)
+
+    rows = []
+    for _, pa_df in df.groupby("pa_id"):
+        pa_df = pa_df.reset_index(drop=True)
+        for i in range(len(pa_df) - 1):
+            p1, p2 = pa_df.iloc[i], pa_df.iloc[i + 1]
+
+            if "plate_x" not in pa_df.columns or "plate_z" not in pa_df.columns:
+                continue
+
+            x1, z1 = float(p1["plate_x"]), float(p1["plate_z"])
+            x2, z2 = float(p2["plate_x"]), float(p2["plate_z"])
+
+            start_dist = np.sqrt((x1 - x2)**2 + (z1 - z2)**2)
+
+            pt1 = str(p1.get("pitch_type", p1.get("pitch_name", "")))
+            pt2 = str(p2.get("pitch_type", p2.get("pitch_name", "")))
+            type_delta = 0.5 if pt1 != pt2 else 0.0
+
+            end_dist = np.sqrt((x1 - x2)**2 + (z1 - z2)**2) + type_delta
+            tunneling_score = round(end_dist - start_dist, 3)
+
+            rows.append({
+                "pa_id": p1["pa_id"],
+                "pitch_type_1": pt1,
+                "pitch_type_2": pt2,
+                "start_dist": round(start_dist, 3),
+                "end_dist": round(end_dist, 3),
+                "tunneling_score": tunneling_score
+            })
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+
+    return out.sort_values("tunneling_score", ascending=False).head(max_sequences)
+
+
+def simulate_abs_challenge(statcast_df):
+    """Simulate ABS (robot ump) challenge system."""
+    if statcast_df is None or statcast_df.empty:
+        return {
+            "total": 0,
+            "human_strikes": 0,
+            "abs_strikes": 0,
+            "overturned_to_strike": 0,
+            "overturned_to_ball": 0,
+            "net_gain": 0
+        }
+
+    df = statcast_df.copy()
+
+    df["abs_call"] = np.where(df["is_in_zone"], "strike", "ball")
+
+    desc = df["description"].fillna("").str.lower()
+    df["human_call"] = "ball"
+    df.loc[desc.str.contains("called_strike"), "human_call"] = "strike"
+    df.loc[desc.str.contains("swinging_strike"), "human_call"] = "strike"
+    df.loc[desc.str.contains("foul"), "human_call"] = "strike"
+
+    total = len(df)
+    human_strikes = int((df["human_call"] == "strike").sum())
+    abs_strikes = int((df["abs_call"] == "strike").sum())
+
+    overturned_to_strike = int(((df["human_call"] == "ball") & (df["abs_call"] == "strike")).sum())
+    overturned_to_ball = int(((df["human_call"] == "strike") & (df["abs_call"] == "ball")).sum())
+
+    return {
+        "total": total,
+        "human_strikes": human_strikes,
+        "abs_strikes": abs_strikes,
+        "overturned_to_strike": overturned_to_strike,
+        "overturned_to_ball": overturned_to_ball,
+        "net_gain": abs_strikes - human_strikes
+    }
+
+
+def compute_percentile_leaderboard(df_p, statcast_df):
+    """Compute Baseball Savant-style percentile ranks."""
+    if df_p.empty or statcast_df.empty:
+        return df_p.assign(
+            WhiffRate_pct=np.nan,
+            FastballVelo_pct=np.nan,
+            ChaseRate_pct=np.nan
+        )
+
+    sc = statcast_df.copy()
+
+    sc["whiff"] = sc.get("is_whiff", 0).astype(int)
+    sc["swing"] = sc.get("is_swing", 0).astype(int)
+
+    sc["chase_swing"] = sc["swing"] * (~sc["is_in_zone"]).astype(int)
+    sc["chase_opp"] = (~sc["is_in_zone"]).astype(int)
+
+    fastball_tags = {"FF", "FA", "FFB", "Four-Seam Fastball", "4-Seam Fastball"}
+    sc["is_fastball"] = sc.get("pitch_type", sc.get("pitch_name", "")).astype(str).isin(fastball_tags)
+
+    agg = sc.groupby("pitcher", as_index=False).agg({
+        "whiff": "sum",
+        "swing": "sum",
+        "chase_swing": "sum",
+        "chase_opp": "sum",
+        "release_speed": "mean"
+    })
+
+    agg["WhiffRate"] = np.where(agg["swing"] > 0, agg["whiff"] / agg["swing"], 0)
+    agg["ChaseRate"] = np.where(agg["chase_opp"] > 0, agg["chase_swing"] / agg["chase_opp"], 0)
+    agg["FastballVelo"] = agg["release_speed"].fillna(0)
+
+    agg["WhiffRate_pct"] = (agg["WhiffRate"].rank(pct=True) * 100).round(0)
+    agg["FastballVelo_pct"] = (agg["FastballVelo"].rank(pct=True) * 100).round(0)
+    agg["ChaseRate_pct"] = (agg["ChaseRate"].rank(pct=True) * 100).round(0)
+
+    return df_p.merge(
+        agg[["pitcher", "WhiffRate_pct", "FastballVelo_pct", "ChaseRate_pct"]],
+        left_on="pitcher", right_on="pitcher", how="left"
+    )
+
 st.sidebar.markdown(
     """
     <style>
@@ -1408,7 +1586,6 @@ if app_mode == "⚡ Live Games":
             if st.button(button_label, key=f"live_game_{row['game_pk']}", use_container_width=True):
                 st.session_state.selected_live_game_pk = int(row["game_pk"])
 
-        # Respect previously-selected game, otherwise default to the first live matchup
         selected_game_pk = st.session_state.get("selected_live_game_pk")
         if selected_game_pk is None and not live_games.empty:
             selected_game_pk = int(live_games.iloc[0]["game_pk"])
@@ -2005,7 +2182,7 @@ elif app_mode == "📊 Player Analysis":
         st.plotly_chart(fig_scatter, use_container_width=True)
 
 # -----------------------------------------------------------------------------
-# 8. PAGE 3: � ADVANCED SCOUTING DASHBOARD
+# 8. PAGE 3: 🔬 ADVANCED SCOUTING DASHBOARD
 # -----------------------------------------------------------------------------
 elif app_mode == "🔬 Advanced Scouting":
     st.title("🔬 Advanced Scouting Dashboard")
@@ -2070,8 +2247,45 @@ elif app_mode == "🔬 Advanced Scouting":
             else:
                 st.info("Workload risk data is not available for this pitcher yet.")
 
+            # --- NEW ADVANCED MODULES INTEGRATION ---
+            st.divider()
+            st.subheader("🔥 Modern Pro-Franchise R&D Metrics")
+
+            scout_tab1, scout_tab2, scout_tab3 = st.tabs(["⚙️ Active Spin & Extension", "🔀 Pitch Tunneling", "🤖 ABS Challenge Simulation"])
+
+            with scout_tab1:
+                st.markdown("#### Active Spin & Release Extension")
+                st.caption("Measures true movement-contributing spin versus perceived velocity extension.")
+                spin_ext_df = compute_active_spin_and_extension(scout_data)
+                if not spin_ext_df.empty:
+                    st.dataframe(spin_ext_df, use_container_width=True, hide_index=True)
+                else:
+                    st.info("Active spin data unavailable for this selection.")
+
+            with scout_tab2:
+                st.markdown("#### Pitch Tunneling Sequences")
+                st.caption("Identifies consecutive pitches that look identical out of the hand before breaking.")
+                tunnel_df = compute_pitch_tunneling_sequences(scout_data)
+                if not tunnel_df.empty:
+                    st.dataframe(tunnel_df, use_container_width=True, hide_index=True)
+                else:
+                    st.info("Tunneling sequence data unavailable.")
+
+            with scout_tab3:
+                st.markdown("#### Robot Umpire (ABS) Challenge Simulation")
+                st.caption("Simulates automated ball-strike challenge outcomes versus human calls.")
+                abs_sim = simulate_abs_challenge(scout_data)
+                if abs_sim["total"] > 0:
+                    ac1, ac2, ac3, ac4 = st.columns(4)
+                    ac1.metric("Total Pitches", abs_sim["total"])
+                    ac2.metric("Human Strikes", abs_sim["human_strikes"])
+                    ac3.metric("ABS Strikes", abs_sim["abs_strikes"])
+                    ac4.metric("Net Strike Gain", abs_sim["net_gain"])
+                else:
+                    st.info("ABS simulation data unavailable.")
+
 # -----------------------------------------------------------------------------
-# 8. PAGE 3: �📈 LEAGUE LEADERBOARD & SORTABLE STATCAST PREVIEW
+# 9. PAGE 4: 📈 LEAGUE LEADERBOARD & SORTABLE STATCAST PREVIEW
 # -----------------------------------------------------------------------------
 elif app_mode == "📈 Leaderboards":
     st.title("📈 League Leaderboard & Statcast Preview")
@@ -2083,6 +2297,12 @@ elif app_mode == "📈 Leaderboards":
         team_filter = st.selectbox('Team filter', ['All'] + sorted([t for t in pitchers_df['Normalized_Team'].dropna().unique().tolist() if t]))
         with st.spinner('Building leaderboard preview...'):
             leaderboard_df = build_league_leaderboard(pitcher_list, selected_season, limit=16)
+            # Merge Savant-style percentiles if available
+            if not leaderboard_df.empty and not pitchers_df.empty:
+                sample_statcast, _ = fetch_pitcher_statcast(pitcher_list[0], selected_season) if pitcher_list else (pd.DataFrame(), None)
+                if not sample_statcast.empty:
+                    leaderboard_df = compute_percentile_leaderboard(leaderboard_df, sample_statcast)
+
         if team_filter != 'All':
             leaderboard_df = leaderboard_df[leaderboard_df['Team'] == team_filter]
         leaderboard_df = leaderboard_df.sort_values('K%', ascending=False) if 'K%' in leaderboard_df.columns else leaderboard_df
@@ -2096,7 +2316,7 @@ elif app_mode == "📈 Leaderboards":
                 st.plotly_chart(fig_leader, use_container_width=True)
 
 # -----------------------------------------------------------------------------
-# 9. PAGE 4: ⚔️ FULL-PAGE PLAYER COMPARISON DASHBOARD
+# 10. PAGE 5: ⚔️ FULL-PAGE PLAYER COMPARISON DASHBOARD
 # -----------------------------------------------------------------------------
 elif app_mode == "⚔️ Player Comparison":
     st.title("⚔️ Full-Scale Player Comparison Dashboard")
@@ -2185,7 +2405,7 @@ elif app_mode == "⚔️ Player Comparison":
             st.plotly_chart(fig_bar, use_container_width=True)
 
 # -----------------------------------------------------------------------------
-# 10. PAGE 5: 🧑‍🤝‍TEAM PITCHERS (ACCURATE TEAM TOTALS & UNIQUE NAMES)
+# 11. PAGE 6: 🧑‍🤝‍TEAM PITCHERS (ACCURATE TEAM TOTALS & UNIQUE NAMES)
 # -----------------------------------------------------------------------------
 elif app_mode == "🧑‍🤝‍Team Pitchers":
     st.title(f"🧑‍🤝‍Team Pitching Staff Roster & Statistics ({selected_season} Season)")
@@ -2256,8 +2476,3 @@ elif app_mode == "🧑‍🤝‍Team Pitchers":
         roster_display = roster_display.sort_values(by='IP', ascending=False) if 'IP' in roster_display.columns else roster_display
         
         st.dataframe(roster_display, use_container_width=True, hide_index=True)
-        # build_statcast_comparison_matrix()
-# build_opponent_breakdown()
-# build_zone_dashboard()
-# build_hitter_weakness_heatmap()
-# build_workload_risk()
