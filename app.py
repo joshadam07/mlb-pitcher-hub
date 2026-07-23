@@ -1079,10 +1079,23 @@ def build_league_leaderboard(pitcher_names, season, limit=12):
             continue
 
         team_name = 'Unknown'
+        # 1. Try checking global roster dataframe first
         if 'pitchers_df' in globals() and isinstance(pitchers_df, pd.DataFrame):
             roster_match = pitchers_df[pitchers_df['Formatted_Name'] == pitcher_name]
             if not roster_match.empty and 'Normalized_Team' in roster_match.columns:
-                team_name = roster_match.iloc[0]['Normalized_Team']
+                val = roster_match.iloc[0]['Normalized_Team']
+                if pd.notna(val) and str(val).strip() not in {'', 'Unknown', 'MLB'}:
+                    team_name = str(val).strip()
+
+        # 2. Fallback: extract directly from Statcast pitch data if still unknown
+        if team_name == 'Unknown' and not data.empty:
+            for team_col in ['home_team', 'away_team']:
+                if team_col in data.columns and not data[team_col].dropna().empty:
+                    code = data[team_col].dropna().iloc[0]
+                    resolved = get_full_team_name(str(code))
+                    if resolved and resolved != "Major League Baseball":
+                        team_name = resolved
+                        break
 
         if 'events' in data.columns and 'pa_id' in data.columns:
             so = len(data[data['events'].fillna('').str.contains('strikeout', case=False)])
