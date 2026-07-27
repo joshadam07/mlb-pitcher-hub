@@ -1754,7 +1754,7 @@ def normalize_app_mode(mode):
                     st.markdown(f"### **{p_name}**")
                     st.markdown(f"**Team:** {best_yesterday['team']} | 📅 **Game Date:** {formatted_date}")
                     st.caption("This spotlight is refreshed daily using the most recent completed game date.")
-                    st.success(f"⚾ **Final Game Result:** {best_yesterday['game_result']}")
+                        
                     st.caption(f"ℹ️ {best_yesterday['departure_score']}")
                     st.markdown(f"**Innings Pitched:** {best_yesterday['ip_ratio']}")
                     st.markdown(f"**Game Stat Line:** {best_yesterday['so']} Strikeouts | {best_yesterday['hits']} Hits | {best_yesterday['walks']} BB | {best_yesterday['total_pitches']} Pitches")
