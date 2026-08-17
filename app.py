@@ -98,311 +98,313 @@ def normalize_app_mode(mode):
     return cleaned
 
 
-    def get_full_team_name(abbrev):
-        if not isinstance(abbrev, str):
-            return "Major League Baseball"
-        return TEAM_FULL_NAMES.get(abbrev.upper().strip(), abbrev)
-
-    PARK_SPEED_MULTIPLIER = {
-        "Colorado Rockies": 1.03,
-        "Arizona Diamondbacks": 1.02,
-        "San Diego Padres": 0.995,
-        "Seattle Mariners": 0.995,
-        "Miami Marlins": 0.995,
-        "Boston Red Sox": 0.99,
-        "New York Yankees": 0.99,
-        "Tampa Bay Rays": 0.99,
-        "Los Angeles Angels": 0.995,
-        "Houston Astros": 0.995,
-    }
-
-    PARK_ZONE_MULTIPLIER = {
-        "Colorado Rockies": 0.98,
-        "Arizona Diamondbacks": 0.99,
-        "San Diego Padres": 1.0,
-        "Seattle Mariners": 1.0,
-        "Miami Marlins": 1.0,
-        "Boston Red Sox": 1.01,
-        "New York Yankees": 1.0,
-        "Tampa Bay Rays": 1.0,
-        "Los Angeles Angels": 1.0,
-        "Houston Astros": 1.0,
-    }
-
-    def get_park_multiplier(team_value, metric='speed'):
-        team_name = normalize_team_name(team_value)
-        if metric == 'zone':
-            return PARK_ZONE_MULTIPLIER.get(team_name, 1.0)
-        return PARK_SPEED_MULTIPLIER.get(team_name, 1.0)
+def get_full_team_name(abbrev):
+    if not isinstance(abbrev, str):
+        return "Major League Baseball"
+    return TEAM_FULL_NAMES.get(abbrev.upper().strip(), abbrev)
 
 
-    def compute_park_adjusted_metrics(df_p):
-        if df_p.empty:
-            return {
-                "avg_speed": 0.0,
-                "avg_spin": 0.0,
-                "zone_pct": 0.0,
-                "park_note": "No park data available"
-            }
+PARK_SPEED_MULTIPLIER = {
+    "Colorado Rockies": 1.03,
+    "Arizona Diamondbacks": 1.02,
+    "San Diego Padres": 0.995,
+    "Seattle Mariners": 0.995,
+    "Miami Marlins": 0.995,
+    "Boston Red Sox": 0.99,
+    "New York Yankees": 0.99,
+    "Tampa Bay Rays": 0.99,
+    "Los Angeles Angels": 0.995,
+    "Houston Astros": 0.995,
+}
 
-        avg_speed = float(df_p['release_speed'].dropna().mean()) if 'release_speed' in df_p.columns else 0.0
-        avg_spin = float(df_p['release_spin_rate'].dropna().mean()) if 'release_spin_rate' in df_p.columns else 0.0
-        zone_pct = float(df_p['is_in_zone'].sum() / len(df_p) * 100) if 'is_in_zone' in df_p.columns and len(df_p) > 0 else 0.0
+PARK_ZONE_MULTIPLIER = {
+    "Colorado Rockies": 0.98,
+    "Arizona Diamondbacks": 0.99,
+    "San Diego Padres": 1.0,
+    "Seattle Mariners": 1.0,
+    "Miami Marlins": 1.0,
+    "Boston Red Sox": 1.01,
+    "New York Yankees": 1.0,
+    "Tampa Bay Rays": 1.0,
+    "Los Angeles Angels": 1.0,
+    "Houston Astros": 1.0,
+}
 
-        if 'home_team' in df_p.columns:
-            speed_factors = df_p['home_team'].fillna('').map(lambda x: get_park_multiplier(x, 'speed'))
-            zone_factors = df_p['home_team'].fillna('').map(lambda x: get_park_multiplier(x, 'zone'))
-            if not speed_factors.empty:
-                speed_factor = speed_factors.mean()
-                avg_speed = round(avg_speed * speed_factor, 1)
-                avg_spin = round(avg_spin * speed_factor, 0)
-            else:
-                avg_speed = round(avg_speed, 1)
-                avg_spin = round(avg_spin, 0)
-            if not zone_factors.empty:
-                zone_pct = round(zone_pct * zone_factors.mean(), 1)
-            else:
-                zone_pct = round(zone_pct, 1)
-            park_note = "Park-adjusted using venue-level factors."
+
+def get_park_multiplier(team_value, metric='speed'):
+    team_name = normalize_team_name(team_value)
+    if metric == 'zone':
+        return PARK_ZONE_MULTIPLIER.get(team_name, 1.0)
+    return PARK_SPEED_MULTIPLIER.get(team_name, 1.0)
+
+
+def compute_park_adjusted_metrics(df_p):
+    if df_p.empty:
+        return {
+            "avg_speed": 0.0,
+            "avg_spin": 0.0,
+            "zone_pct": 0.0,
+            "park_note": "No park data available"
+        }
+
+    avg_speed = float(df_p['release_speed'].dropna().mean()) if 'release_speed' in df_p.columns else 0.0
+    avg_spin = float(df_p['release_spin_rate'].dropna().mean()) if 'release_spin_rate' in df_p.columns else 0.0
+    zone_pct = float(df_p['is_in_zone'].sum() / len(df_p) * 100) if 'is_in_zone' in df_p.columns and len(df_p) > 0 else 0.0
+
+    if 'home_team' in df_p.columns:
+        speed_factors = df_p['home_team'].fillna('').map(lambda x: get_park_multiplier(x, 'speed'))
+        zone_factors = df_p['home_team'].fillna('').map(lambda x: get_park_multiplier(x, 'zone'))
+        if not speed_factors.empty:
+            speed_factor = speed_factors.mean()
+            avg_speed = round(avg_speed * speed_factor, 1)
+            avg_spin = round(avg_spin * speed_factor, 0)
         else:
             avg_speed = round(avg_speed, 1)
             avg_spin = round(avg_spin, 0)
+        if not zone_factors.empty:
+            zone_pct = round(zone_pct * zone_factors.mean(), 1)
+        else:
             zone_pct = round(zone_pct, 1)
-            park_note = "Park adjustment unavailable without home team data."
+        park_note = "Park-adjusted using venue-level factors."
+    else:
+        avg_speed = round(avg_speed, 1)
+        avg_spin = round(avg_spin, 0)
+        zone_pct = round(zone_pct, 1)
+        park_note = "Park adjustment unavailable without home team data."
 
-        return {
-            "avg_speed": avg_speed,
-            "avg_spin": avg_spin,
-            "zone_pct": zone_pct,
-            "park_note": park_note
-        }
+    return {
+        "avg_speed": avg_speed,
+        "avg_spin": avg_spin,
+        "zone_pct": zone_pct,
+        "park_note": park_note
+    }
 
 
-    def normalize_team_name(team_value):
-        """Normalize MLB team values to a canonical franchise name."""
-        if not isinstance(team_value, str):
-            return "Major League Baseball"
+def normalize_team_name(team_value):
+    """Normalize MLB team values to a canonical franchise name."""
+    if not isinstance(team_value, str):
+        return "Major League Baseball"
 
-        raw_value = team_value.split("<")[0].strip()
-        if not raw_value:
-            return "Major League Baseball"
+    raw_value = team_value.split("<")[0].strip()
+    if not raw_value:
+        return "Major League Baseball"
 
-        raw_value = raw_value.replace("–", "-").replace("—", "-")
-        raw_value = raw_value.split(" (")[0].strip()
+    raw_value = raw_value.replace("–", "-").replace("—", "-")
+    raw_value = raw_value.split(" (")[0].strip()
 
-        upper_value = raw_value.upper()
+    upper_value = raw_value.upper()
+    if upper_value in TEAM_FULL_NAMES:
+        return TEAM_FULL_NAMES[upper_value]
+
+    for full_name in TEAM_FULL_NAMES.values():
+        if full_name.upper() == upper_value:
+            return full_name
+
+    shorthand_mappings = {
+        "ARIZONA": "Arizona Diamondbacks",
+        "ATLANTA": "Atlanta Braves",
+        "BALTIMORE": "Baltimore Orioles",
+        "BOSTON": "Boston Red Sox",
+        "CHICAGO": ["Chicago Cubs", "Chicago White Sox"],
+        "CHICAGO CUBS": "Chicago Cubs",
+        "CHICAGO WHITE SOX": "Chicago White Sox",
+        "CINCINNATI": "Cincinnati Reds",
+        "CLEVELAND": "Cleveland Guardians",
+        "COLORADO": "Colorado Rockies",
+        "DETROIT": "Detroit Tigers",
+        "HOUSTON": "Houston Astros",
+        "KANSAS CITY": "Kansas City Royals",
+        "LOS ANGELES ANGELS": "Los Angeles Angels",
+        "LOS ANGELES DODGERS": "Los Angeles Dodgers",
+        "MIAMI": "Miami Marlins",
+        "MILWAUKEE": "Milwaukee Brewers",
+        "MINNESOTA": "Minnesota Twins",
+        "NEW YORK": ["New York Mets", "New York Yankees"],
+        "NEW YORK METS": "New York Mets",
+        "NEW YORK YANKEES": "New York Yankees",
+        "OAKLAND": "Oakland Athletics",
+        "PHILADELPHIA": "Philadelphia Phillies",
+        "PITTSBURGH": "Pittsburgh Pirates",
+        "SAN DIEGO": "San Diego Padres",
+        "SAN FRANCISCO": "San Francisco Giants",
+        "SEATTLE": "Seattle Mariners",
+        "ST. LOUIS": "St. Louis Cardinals",
+        "TAMPA BAY": "Tampa Bay Rays",
+        "TEXAS": "Texas Rangers",
+        "TORONTO": "Toronto Blue Jays",
+        "WASHINGTON": "Washington Nationals",
+    }
+    if upper_value in shorthand_mappings:
+        mapped_value = shorthand_mappings[upper_value]
+        if isinstance(mapped_value, list):
+            return mapped_value[0]
+        return mapped_value
+
+    for full_name in TEAM_FULL_NAMES.values():
+        if full_name.upper() in upper_value:
+            return full_name
+
+    return raw_value
+
+
+def normalize_team_candidates(team_value):
+    """Return one or more canonical team names from a raw value such as 'Minnesota,Philadelphia'."""
+    if not isinstance(team_value, str):
+        return []
+
+    raw_value = team_value.split("<")[0].strip()
+    if not raw_value:
+        return []
+
+    parts = [part.strip() for part in raw_value.replace(";", ",").split(",") if part.strip()]
+    candidates = []
+    for part in parts:
+        upper_value = part.upper()
         if upper_value in TEAM_FULL_NAMES:
-            return TEAM_FULL_NAMES[upper_value]
-
+            candidates.append(TEAM_FULL_NAMES[upper_value])
+            continue
         for full_name in TEAM_FULL_NAMES.values():
             if full_name.upper() == upper_value:
-                return full_name
-
-        shorthand_mappings = {
-            "ARIZONA": "Arizona Diamondbacks",
-            "ATLANTA": "Atlanta Braves",
-            "BALTIMORE": "Baltimore Orioles",
-            "BOSTON": "Boston Red Sox",
-            "CHICAGO": ["Chicago Cubs", "Chicago White Sox"],
-            "CHICAGO CUBS": "Chicago Cubs",
-            "CHICAGO WHITE SOX": "Chicago White Sox",
-            "CINCINNATI": "Cincinnati Reds",
-            "CLEVELAND": "Cleveland Guardians",
-            "COLORADO": "Colorado Rockies",
-            "DETROIT": "Detroit Tigers",
-            "HOUSTON": "Houston Astros",
-            "KANSAS CITY": "Kansas City Royals",
-            "LOS ANGELES ANGELS": "Los Angeles Angels",
-            "LOS ANGELES DODGERS": "Los Angeles Dodgers",
-            "MIAMI": "Miami Marlins",
-            "MILWAUKEE": "Milwaukee Brewers",
-            "MINNESOTA": "Minnesota Twins",
-            "NEW YORK": ["New York Mets", "New York Yankees"],
-            "NEW YORK METS": "New York Mets",
-            "NEW YORK YANKEES": "New York Yankees",
-            "OAKLAND": "Oakland Athletics",
-            "PHILADELPHIA": "Philadelphia Phillies",
-            "PITTSBURGH": "Pittsburgh Pirates",
-            "SAN DIEGO": "San Diego Padres",
-            "SAN FRANCISCO": "San Francisco Giants",
-            "SEATTLE": "Seattle Mariners",
-            "ST. LOUIS": "St. Louis Cardinals",
-            "TAMPA BAY": "Tampa Bay Rays",
-            "TEXAS": "Texas Rangers",
-            "TORONTO": "Toronto Blue Jays",
-            "WASHINGTON": "Washington Nationals",
-        }
-        if upper_value in shorthand_mappings:
-            mapped_value = shorthand_mappings[upper_value]
-            if isinstance(mapped_value, list):
-                return mapped_value[0]
-            return mapped_value
-
-        for full_name in TEAM_FULL_NAMES.values():
-            if full_name.upper() in upper_value:
-                return full_name
-
-        return raw_value
-
-
-    def normalize_team_candidates(team_value):
-        """Return one or more canonical team names from a raw value such as 'Minnesota,Philadelphia'."""
-        if not isinstance(team_value, str):
-            return []
-
-        raw_value = team_value.split("<")[0].strip()
-        if not raw_value:
-            return []
-
-        parts = [part.strip() for part in raw_value.replace(";", ",").split(",") if part.strip()]
-        candidates = []
-        for part in parts:
-            upper_value = part.upper()
-            if upper_value in TEAM_FULL_NAMES:
-                candidates.append(TEAM_FULL_NAMES[upper_value])
-                continue
-            for full_name in TEAM_FULL_NAMES.values():
-                if full_name.upper() == upper_value:
-                    candidates.append(full_name)
-                    break
+                candidates.append(full_name)
+                break
+        else:
+            shorthand_mappings = {
+                "CHICAGO": ["Chicago Cubs", "Chicago White Sox"],
+                "NEW YORK": ["New York Mets", "New York Yankees"],
+                "MINNESOTA": ["Minnesota Twins"],
+                "PHILADELPHIA": ["Philadelphia Phillies"],
+                "MILWAUKEE": ["Milwaukee Brewers"],
+                "BOSTON": ["Boston Red Sox"],
+                "ATLANTA": ["Atlanta Braves"],
+                "SAN FRANCISCO": ["San Francisco Giants"],
+                "SAN DIEGO": ["San Diego Padres"],
+                "SEATTLE": ["Seattle Mariners"],
+                "TAMPA BAY": ["Tampa Bay Rays"],
+                "WASHINGTON": ["Washington Nationals"],
+            }
+            if upper_value in shorthand_mappings:
+                candidates.extend(shorthand_mappings[upper_value])
             else:
-                shorthand_mappings = {
-                    "CHICAGO": ["Chicago Cubs", "Chicago White Sox"],
-                    "NEW YORK": ["New York Mets", "New York Yankees"],
-                    "MINNESOTA": ["Minnesota Twins"],
-                    "PHILADELPHIA": ["Philadelphia Phillies"],
-                    "MILWAUKEE": ["Milwaukee Brewers"],
-                    "BOSTON": ["Boston Red Sox"],
-                    "ATLANTA": ["Atlanta Braves"],
-                    "SAN FRANCISCO": ["San Francisco Giants"],
-                    "SAN DIEGO": ["San Diego Padres"],
-                    "SEATTLE": ["Seattle Mariners"],
-                    "TAMPA BAY": ["Tampa Bay Rays"],
-                    "WASHINGTON": ["Washington Nationals"],
-                }
-                if upper_value in shorthand_mappings:
-                    candidates.extend(shorthand_mappings[upper_value])
-                else:
-                    normalized = normalize_team_name(part)
-                    if normalized != "Major League Baseball" and normalized not in candidates:
-                        candidates.append(normalized)
+                normalized = normalize_team_name(part)
+                if normalized != "Major League Baseball" and normalized not in candidates:
+                    candidates.append(normalized)
 
-        return list(dict.fromkeys(candidates))
+    return list(dict.fromkeys(candidates))
 
 
-    def get_team_code_aliases(full_name):
-        """Returns all 2-letter and 3-letter codes that map to a full franchise name."""
-        return [k.upper().strip() for k, v in TEAM_FULL_NAMES.items() if v == full_name]
+def get_team_code_aliases(full_name):
+    """Returns all 2-letter and 3-letter codes that map to a full franchise name."""
+    return [k.upper().strip() for k, v in TEAM_FULL_NAMES.items() if v == full_name]
 
 
-    def fetch_json(url, timeout=10):
-        """Fetch JSON from a URL with a simple timeout and graceful error handling."""
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=timeout) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except (HTTPError, URLError, TimeoutError, ValueError, json.JSONDecodeError):
-            return None
+def fetch_json(url, timeout=10):
+    """Fetch JSON from a URL with a simple timeout and graceful error handling."""
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except (HTTPError, URLError, TimeoutError, ValueError, json.JSONDecodeError):
+        return None
 
+@st.cache_data(ttl=60, show_spinner=False)
+def get_live_mlb_schedule(target_date=None):
+    """Fetch today's MLB schedule and normalize the games into a scoreboard-friendly dataframe."""
+    if target_date is None:
+        target_date = datetime.date.today().strftime("%Y-%m-%d")
 
-    def get_live_mlb_schedule(target_date=None):
-        """Fetch today's MLB schedule and normalize the games into a scoreboard-friendly dataframe."""
-        if target_date is None:
-            target_date = datetime.date.today().strftime("%Y-%m-%d")
+    url = f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&date={target_date}"
+    payload = fetch_json(url)
+    if not payload:
+        return pd.DataFrame(columns=["game_pk", "home_team", "away_team", "home_score", "away_score", "status", "inning", "outs", "is_live", "venue", "game_time"])
 
-        url = f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&date={target_date}"
-        payload = fetch_json(url)
-        if not payload:
-            return pd.DataFrame(columns=["game_pk", "home_team", "away_team", "home_score", "away_score", "status", "inning", "outs", "is_live", "venue", "game_time"])
+    def _format_inning_label(linescore, status):
+        if not linescore:
+            return ""
+        if isinstance(status, str) and status.lower().startswith("final"):
+            return "Final"
+        inning_state = linescore.get("inningState") or ""
+        inning_ordinal = linescore.get("currentInningOrdinal") or linescore.get("currentInning") or ""
+        if inning_state:
+            return f"{inning_state} {inning_ordinal}".strip()
+        return str(inning_ordinal) if inning_ordinal else ""
 
-        def _format_inning_label(linescore, status):
-            if not linescore:
-                return ""
-            if isinstance(status, str) and status.lower().startswith("final"):
-                return "Final"
-            inning_state = linescore.get("inningState") or ""
-            inning_ordinal = linescore.get("currentInningOrdinal") or linescore.get("currentInning") or ""
-            if inning_state:
-                return f"{inning_state} {inning_ordinal}".strip()
-            return str(inning_ordinal) if inning_ordinal else ""
+    def _is_live_state(status, linescore):
+        if not isinstance(status, str):
+            status = ""
+        lower = status.lower()
+        if any(token in lower for token in ["in progress", "live", "warmup", "delayed"]):
+            return True
+        if linescore.get("currentInning") or linescore.get("currentInningOrdinal"):
+            return not lower.startswith("final")
+        return False
 
-        def _is_live_state(status, linescore):
-            if not isinstance(status, str):
-                status = ""
-            lower = status.lower()
-            if any(token in lower for token in ["in progress", "live", "warmup", "delayed"]):
-                return True
-            if linescore.get("currentInning") or linescore.get("currentInningOrdinal"):
-                return not lower.startswith("final")
-            return False
+    games = []
+    for date_entry in payload.get("dates", []):
+        for game in date_entry.get("games", []):
+            status = game.get("status", {}).get("detailedState", "Scheduled")
+            linescore = game.get("linescore", {}) or {}
+            home_team = game.get("teams", {}).get("home", {}).get("team", {}).get("name", "Unknown")
+            away_team = game.get("teams", {}).get("away", {}).get("team", {}).get("name", "Unknown")
+            home_score = game.get("teams", {}).get("home", {}).get("score")
+            away_score = game.get("teams", {}).get("away", {}).get("score")
+            outs = linescore.get("outs") or ""
+            inning_label = _format_inning_label(linescore, status)
+            is_live = _is_live_state(status, linescore)
 
-        games = []
-        for date_entry in payload.get("dates", []):
-            for game in date_entry.get("games", []):
-                status = game.get("status", {}).get("detailedState", "Scheduled")
-                linescore = game.get("linescore", {}) or {}
-                home_team = game.get("teams", {}).get("home", {}).get("team", {}).get("name", "Unknown")
-                away_team = game.get("teams", {}).get("away", {}).get("team", {}).get("name", "Unknown")
-                home_score = game.get("teams", {}).get("home", {}).get("score")
-                away_score = game.get("teams", {}).get("away", {}).get("score")
-                outs = linescore.get("outs") or ""
-                inning_label = _format_inning_label(linescore, status)
-                is_live = _is_live_state(status, linescore)
+            games.append({
+                "game_pk": game.get("gamePk"),
+                "home_team": home_team,
+                "away_team": away_team,
+                "home_score": home_score if home_score is not None else 0,
+                "away_score": away_score if away_score is not None else 0,
+                "status": status,
+                "inning": inning_label,
+                "outs": outs,
+                "is_live": is_live,
+                "venue": game.get("venue", {}).get("name", ""),
+                "game_time": game.get("gameDate", "")
+            })
 
-                games.append({
-                    "game_pk": game.get("gamePk"),
-                    "home_team": home_team,
-                    "away_team": away_team,
-                    "home_score": home_score if home_score is not None else 0,
-                    "away_score": away_score if away_score is not None else 0,
-                    "status": status,
-                    "inning": inning_label,
-                    "outs": outs,
-                    "is_live": is_live,
-                    "venue": game.get("venue", {}).get("name", ""),
-                    "game_time": game.get("gameDate", "")
-                })
+    return pd.DataFrame(games)
 
-        return pd.DataFrame(games)
+@st.cache_data(ttl=30, show_spinner=False)
+def build_live_game_feed(game_pk):
+    """Fetch a single game's live feed and return a lightweight structure for display."""
+    if not game_pk:
+        return None
 
+    payload = fetch_json(f"https://statsapi.mlb.com/api/v1.1/game/{game_pk}/feed/live")
+    if not payload:
+        return None
 
-    def build_live_game_feed(game_pk):
-        """Fetch a single game's live feed and return a lightweight structure for display."""
-        if not game_pk:
-            return None
+    live_data = payload.get("liveData", {}) or {}
+    boxscore = live_data.get("boxscore", {}) or {}
+    teams = boxscore.get("teams", {}) or {}
+    plays = live_data.get("plays", {}).get("allPlays", []) or []
 
-        payload = fetch_json(f"https://statsapi.mlb.com/api/v1.1/game/{game_pk}/feed/live")
-        if not payload:
-            return None
+    def _pitcher_lookup(team_key):
+        team_box = teams.get(team_key, {}) or {}
+        pitchers = team_box.get("pitchers", []) or []
+        players = team_box.get("players", {}) or {}
+        names = []
+        for pitcher_id in pitchers[:2]:
+            player = players.get(str(pitcher_id), {}) or {}
+            person = player.get("person", {}) or {}
+            full_name = person.get("fullName")
+            if full_name:
+                names.append(full_name)
+        return names
 
-        live_data = payload.get("liveData", {}) or {}
-        boxscore = live_data.get("boxscore", {}) or {}
-        teams = boxscore.get("teams", {}) or {}
-        plays = live_data.get("plays", {}).get("allPlays", []) or []
-
-        def _pitcher_lookup(team_key):
-            team_box = teams.get(team_key, {}) or {}
-            pitchers = team_box.get("pitchers", []) or []
-            players = team_box.get("players", {}) or {}
-            names = []
-            for pitcher_id in pitchers[:2]:
-                player = players.get(str(pitcher_id), {}) or {}
-                person = player.get("person", {}) or {}
-                full_name = person.get("fullName")
-                if full_name:
-                    names.append(full_name)
-            return names
-
-        live_game = {
-            "game_pk": game_pk,
-            "game_data": payload.get("gameData", {}),
-            "live_data": live_data,
-            "boxscore": boxscore,
-            "plays": plays,
-            "home_pitchers": _pitcher_lookup("home"),
-            "away_pitchers": _pitcher_lookup("away"),
-        }
-        return live_game
+    live_game = {
+        "game_pk": game_pk,
+        "game_data": payload.get("gameData", {}),
+        "live_data": live_data,
+        "boxscore": boxscore,
+        "plays": plays,
+        "home_pitchers": _pitcher_lookup("home"),
+        "away_pitchers": _pitcher_lookup("away"),
+    }
+    return live_game
 
 
     def build_live_pitch_log(live_game):
@@ -1586,16 +1588,7 @@ def normalize_app_mode(mode):
         refresh_live = st.button("Refresh live games")
         if refresh_live:
             st.cache_data.clear()
-            st.rerun()
-
-        if "live_refresh_counter" not in st.session_state:
-            st.session_state.live_refresh_counter = 0
-
-        if st.session_state.live_refresh_counter % 4 == 0:
-            st.session_state.live_refresh_counter += 1
-            st.rerun()
-        else:
-            st.session_state.live_refresh_counter += 1
+            st.success("Live data refreshed.")
 
         if "selected_live_game_pk" not in st.session_state:
             st.session_state.selected_live_game_pk = None
