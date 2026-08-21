@@ -392,7 +392,7 @@ def fetch_pitcher_statcast(pitcher_name, season):
 
 def safe_statcast_fetch(pitcher_name, season, max_retries=1):
     """Wrapper around fetch_pitcher_statcast with better error handling and retry logic."""
-    for attempt in range(max_retries):
+    for _ in range(max(1, max_retries)):
         try:
             data, mlbam_id = fetch_pitcher_statcast(pitcher_name, season)
             if data is not None and not data.empty:
@@ -413,7 +413,7 @@ def fetch_json(url, timeout=10):
             if not data:
                 return None
             return json.loads(data)
-    except (HTTPError, URLError, TimeoutError, ValueError, json.JSONDecodeError, Exception) as e:
+    except Exception:
         # Silently return None for expected network errors; don't spam logs
         return None
 
@@ -1319,7 +1319,7 @@ def build_matchup_simulator(df_p, batter_name):
 def build_league_leaderboard(pitcher_names, season, limit=12):
     rows = []
     for pitcher_name in list(pitcher_names)[:limit]:
-        data, player_id = fetch_pitcher_statcast(pitcher_name, season)
+        data, _ = fetch_pitcher_statcast(pitcher_name, season)
         if data.empty:
             continue
 
@@ -1378,7 +1378,7 @@ def build_league_leaderboard(pitcher_names, season, limit=12):
 def build_statcast_comparison_matrix(pitcher_names, season, limit=24):
     rows = []
     for pitcher_name in list(pitcher_names)[:limit]:
-        data, player_id = fetch_pitcher_statcast(pitcher_name, season)
+        data, _ = fetch_pitcher_statcast(pitcher_name, season)
         if data.empty:
             continue
 
@@ -1429,7 +1429,7 @@ def build_opponent_breakdown(df_p, team_name):
 
     summary = work.groupby('Opponent', as_index=False).agg(
         Pitches=('Opponent', 'size'),
-        Whiffs=('is_whiff', 'sum') if 'is_whiff' in work.columns else ('Opponent', lambda x: 0)
+        Whiffs=('is_whiff', 'sum') if 'is_whiff' in work.columns else ('Opponent', lambda _: 0)
     )
     summary['Whiff Rate %'] = ((summary['Whiffs'] / summary['Pitches']) * 100).round(1)
     summary['Batting Avg Against'] = 0.230 # Placeholder estimation or modeled metric
@@ -1454,7 +1454,7 @@ def build_zone_dashboard(df_p, pitch_type='All', zone_filter='All'):
 
     summary = work.groupby('Zone', as_index=False).agg(
         Pitches=('Zone', 'size'),
-        Whiffs=('is_whiff', 'sum') if 'is_whiff' in work.columns else ('Zone', lambda x: 0)
+        Whiffs=('is_whiff', 'sum') if 'is_whiff' in work.columns else ('Zone', lambda _: 0)
     )
     summary['Whiff Rate %'] = ((summary['Whiffs'] / summary['Pitches']) * 100).round(1)
     
@@ -1483,7 +1483,7 @@ def build_hitter_weakness_heatmap(df_p, hitter_name):
 
     summary = work.groupby('Zone', as_index=False).agg(
         Pitches_Seen=('Zone', 'size'),
-        Whiffs=('is_whiff', 'sum') if 'is_whiff' in work.columns else ('Zone', lambda x: 0)
+        Whiffs=('is_whiff', 'sum') if 'is_whiff' in work.columns else ('Zone', lambda _: 0)
     )
     summary['Whiff Rate %'] = ((summary['Whiffs'] / summary['Pitches_Seen']) * 100).round(1)
     summary = summary.rename(columns={'Pitches_Seen': 'Pitches Seen'})
